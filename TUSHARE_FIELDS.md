@@ -1,6 +1,6 @@
-# Tushare fields used by V3.1
+# Tushare fields used by V3.2
 
-This file intentionally keeps Tushare's provider field names unchanged in JSON.
+This file intentionally keeps Tushare's provider field names unchanged in JSON. V3.2 adds non-Tushare realtime fallback providers, but the Tushare field definitions below remain unchanged and are automatically preferred whenever the account has permission.
 
 ## daily_basic
 

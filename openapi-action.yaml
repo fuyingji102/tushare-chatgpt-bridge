@@ -1,8 +1,12 @@
 openapi: 3.1.0
 info:
   title: A-share Market Discussion Data
-  version: 3.1.0
-  description: Read-only fresh A-share market data for ChatGPT trading discussion. No brokerage or order functions.
+  version: 3.2.0
+  description: >
+    Read-only A-share market data for ChatGPT discussion. Tushare is the preferred
+    provider; when a realtime/advanced permission is unavailable the service can
+    fall back to public quote providers and returns explicit source, freshness,
+    coverage and cross-check quality fields. No brokerage or order functions.
 servers:
   - url: https://REPLACE_WITH_YOUR_NETLIFY_DOMAIN
 security:
@@ -11,53 +15,92 @@ paths:
   /health:
     get:
       operationId: healthCheck
-      summary: Check whether the market-data service is online.
+      summary: Check whether the market-data service is online and get its version.
       responses:
         "200": { description: Health status }
+
+  /diagnostics/providers:
+    get:
+      operationId: diagnoseDataProviders
+      summary: Diagnose Tushare and free fallback provider availability for one stock.
+      description: >
+        Returns provider reachability, latency, source timestamps, quote consensus,
+        and last-minute-bar status. Use after deployment or when realtime data looks stale.
+      parameters:
+        - name: ts_code
+          in: query
+          required: false
+          schema: { type: string, default: 600522.SH }
+        - name: freq
+          in: query
+          required: false
+          schema: { type: string, enum: [1MIN, 5MIN, 15MIN, 30MIN, 60MIN], default: 5MIN }
+      responses:
+        "200": { description: Provider diagnostics }
+
   /market/overview:
     get:
       operationId: getMarketOverview
-      summary: Get realtime A-share market breadth, major indices, turnover and leaders.
+      summary: Get current A-share market overview with explicit realtime/fallback coverage.
+      description: >
+        Uses full realtime market breadth only when the selected provider returns adequate
+        coverage. Otherwise breadth remains the latest completed Tushare daily session while
+        realtime indices/leaders may be supplied separately and clearly labeled.
       responses:
-        "200": { description: Realtime market overview }
+        "200": { description: Market overview with source and freshness metadata }
+
   /market/sentiment:
     get:
       operationId: getMarketSentiment
-      summary: Get realtime market sentiment including sealed limit-ups, opened boards, limit-downs and estimated streak ladder.
-      description: Uses realtime quotes plus today's official limit prices. Estimated streak uses prior-day ladder and is explicitly an inference.
+      summary: Get market sentiment, limit boards and breadth with explicit coverage semantics.
+      description: >
+        Combines available realtime quotes with official Tushare limit prices. If only a ranked
+        realtime subset is available, counts are labeled observed lower bounds, not whole-market totals.
+        Advanced KPL/limit-step fields automatically become available when Tushare permissions allow.
       responses:
-        "200": { description: Realtime market sentiment }
+        "200": { description: Market sentiment }
+
   /market/scan:
     get:
       operationId: getMarketScan
-      summary: Scan realtime strong industries, industry leaders, top gainers, turnover leaders and liquid momentum candidates.
+      summary: Scan strong industries and realtime market leaders with source/coverage metadata.
       parameters:
         - { name: sector_top_n, in: query, required: false, schema: { type: integer, default: 8, minimum: 3, maximum: 15 } }
         - { name: leaders_per_sector, in: query, required: false, schema: { type: integer, default: 4, minimum: 1, maximum: 8 } }
         - { name: market_top_n, in: query, required: false, schema: { type: integer, default: 15, minimum: 5, maximum: 30 } }
         - { name: min_amount_million, in: query, required: false, schema: { type: number, default: 100, minimum: 0 } }
       responses:
-        "200": { description: Realtime market scan }
+        "200": { description: Market scan }
+
   /market/themes:
     get:
       operationId: getMarketThemes
-      summary: Evaluate concept themes and retrieve latest strong-theme and theme-moneyflow context.
-      description: If q is supplied, matching THS concepts are evaluated against current member quotes. Board/moneyflow context is post-close and dated.
+      summary: Evaluate concept themes and retrieve dated strong-theme context.
+      description: >
+        Tushare THS concept definitions/members are preferred when permitted. If unavailable,
+        Eastmoney concept boards/members are used as a realtime fallback. Advanced Tushare
+        strong-theme and concept-moneyflow datasets remain available automatically when permissions increase.
       parameters:
         - name: q
           in: query
           required: false
           schema: { type: string }
-          description: Concept name or comma-separated names, for example MLCC,创新药,光通信.
+          description: Concept name or comma-separated names, e.g. MLCC,创新药,光通信.
         - { name: top_n, in: query, required: false, schema: { type: integer, default: 8, minimum: 3, maximum: 15 } }
         - { name: leaders, in: query, required: false, schema: { type: integer, default: 5, minimum: 3, maximum: 10 } }
       responses:
         "200": { description: Theme evaluation and context }
+
   /stock/{ts_code}/snapshot:
     get:
       operationId: getStockSnapshot
       summary: Preferred one-call stock snapshot for current trading discussion.
-      description: Returns realtime quote when permitted, MA5/10/20/60, MACD, RSI14, Slow KDJ, volume pace, 20-day range, latest post-close moneyflow, daily_basic, financing/margin context, chip-cost estimate, and recent KPL board history.
+      description: >
+        Tushare realtime is preferred. When unavailable, Eastmoney then Sina can supply realtime
+        quote/minute data. Returned data_quality contains timestamp freshness and independent quote
+        cross-checks. Daily technicals remain based on Tushare qfq history. Also includes daily_basic,
+        margin financing, post-close moneyflow with standard-moneyflow fallback, optional chip-cost,
+        and recent KPL history when permitted.
       parameters:
         - name: ts_code
           in: path
@@ -74,46 +117,11 @@ paths:
           schema: { type: integer, minimum: 80, maximum: 500, default: 180 }
       responses:
         "200": { description: Stock snapshot }
-  /stock/{ts_code}/context:
-    get:
-      operationId: getStockTradingContext
-      summary: Get post-close trading context including turnover/valuation, margin financing, chip-cost distribution, and KPL board history.
-      description: Uses Tushare daily_basic, margin_detail, cyq_perf, and kpl_list with original provider field names.
-      parameters:
-        - { name: ts_code, in: path, required: true, schema: { type: string } }
-        - { name: days, in: query, required: false, schema: { type: integer, minimum: 20, maximum: 240, default: 90 } }
-      responses:
-        "200": { description: Stock trading context }
-  /stock/{ts_code}/lhb:
-    get:
-      operationId: getStockDragonTiger
-      summary: Get recent Dragon-Tiger List institution/broker-seat detail for one stock.
-      description: Uses Tushare top_inst. Without trade_date, checks a small recent trading-day window and returns sessions where the stock appeared.
-      parameters:
-        - { name: ts_code, in: path, required: true, schema: { type: string } }
-        - name: trade_date
-          in: query
-          required: false
-          schema: { type: string, pattern: '^\d{8}$' }
-          description: Optional exact YYYYMMDD date.
-        - { name: days, in: query, required: false, schema: { type: integer, minimum: 1, maximum: 10, default: 5 } }
-      responses:
-        "200": { description: Dragon-Tiger List details }
-  /stock/{ts_code}/risk-events:
-    get:
-      operationId: getStockRiskEvents
-      summary: Get upcoming/recent event-risk context for one stock.
-      description: Includes share unlocks, shareholder increases/decreases, earnings forecasts, disclosure schedule, and recent repurchase records.
-      parameters:
-        - { name: ts_code, in: path, required: true, schema: { type: string } }
-        - { name: forward_days, in: query, required: false, schema: { type: integer, minimum: 30, maximum: 365, default: 90 } }
-        - { name: backward_days, in: query, required: false, schema: { type: integer, minimum: 30, maximum: 365, default: 120 } }
-      responses:
-        "200": { description: Stock event-risk context }
+
   /stock/{ts_code}/intraday:
     get:
       operationId: getStockIntraday
-      summary: Get today's cumulative intraday minute bars for one stock.
+      summary: Get current-session intraday minute bars using Tushare first, then fallbacks.
       parameters:
         - { name: ts_code, in: path, required: true, schema: { type: string } }
         - name: freq
@@ -121,25 +129,64 @@ paths:
           required: false
           schema: { type: string, enum: [1MIN, 5MIN, 15MIN, 30MIN, 60MIN], default: 5MIN }
       responses:
-        "200": { description: Intraday bars }
+        "200": { description: Intraday bars with quality metadata }
+
   /stock/{ts_code}/daily:
     get:
       operationId: getStockDaily
-      summary: Get qfq daily bars for one stock.
+      summary: Get Tushare qfq daily bars for one stock.
       parameters:
         - { name: ts_code, in: path, required: true, schema: { type: string } }
         - { name: days, in: query, required: false, schema: { type: integer, minimum: 20, maximum: 500, default: 120 } }
       responses:
         "200": { description: QFQ daily bars }
+
   /stock/{ts_code}/moneyflow:
     get:
       operationId: getStockMoneyflow
-      summary: Get recent post-close stock moneyflow.
+      summary: Get recent post-close stock moneyflow, preferring THS then standard Tushare moneyflow.
       parameters:
         - { name: ts_code, in: path, required: true, schema: { type: string } }
         - { name: days, in: query, required: false, schema: { type: integer, minimum: 1, maximum: 120, default: 20 } }
       responses:
         "200": { description: Moneyflow history }
+
+  /stock/{ts_code}/context:
+    get:
+      operationId: getStockTradingContext
+      summary: Get post-close turnover/valuation, margin, optional chip-cost and KPL context.
+      parameters:
+        - { name: ts_code, in: path, required: true, schema: { type: string } }
+        - { name: days, in: query, required: false, schema: { type: integer, minimum: 20, maximum: 240, default: 90 } }
+      responses:
+        "200": { description: Stock trading context }
+
+  /stock/{ts_code}/lhb:
+    get:
+      operationId: getStockDragonTiger
+      summary: Get recent Dragon-Tiger List institution/broker-seat detail when permitted.
+      parameters:
+        - { name: ts_code, in: path, required: true, schema: { type: string } }
+        - name: trade_date
+          in: query
+          required: false
+          schema: { type: string, pattern: '^\d{8}$' }
+        - { name: days, in: query, required: false, schema: { type: integer, minimum: 1, maximum: 10, default: 5 } }
+      responses:
+        "200": { description: Dragon-Tiger List details }
+
+  /stock/{ts_code}/risk-events:
+    get:
+      operationId: getStockRiskEvents
+      summary: Get upcoming/recent event-risk context for one stock.
+      description: Includes share unlocks, holder changes, earnings forecasts, disclosure schedule and repurchase records when permitted.
+      parameters:
+        - { name: ts_code, in: path, required: true, schema: { type: string } }
+        - { name: forward_days, in: query, required: false, schema: { type: integer, minimum: 30, maximum: 365, default: 90 } }
+        - { name: backward_days, in: query, required: false, schema: { type: integer, minimum: 30, maximum: 365, default: 120 } }
+      responses:
+        "200": { description: Stock event-risk context }
+
 components:
   securitySchemes:
     ApiKeyAuth:

@@ -1,15 +1,21 @@
-你要做的事情（最短版）
+Tushare ChatGPT Bridge V3.2 — upgrade checklist
 
-[ ] 1. 解压 V3.1 包
-[ ] 2. 上传到一个私有 GitHub 仓库
-[ ] 3. Netlify -> Import from GitHub -> 选择该仓库 -> Deploy
-[ ] 4. Netlify Environment variables 添加 TUSHARE_TOKEN
-[ ] 5. 生成随机 ACTION_API_KEY，并在 Netlify 添加它
-[ ] 6. Redeploy
-[ ] 7. 测试 https://你的站点.netlify.app/health
-[ ] 8. 测试 /stock/600522.SH/snapshot、/stock/600522.SH/context、/market/overview
-[ ] 9. openapi-action.yaml 中替换 Netlify 域名
-[ ] 10. 在 GPT Action 中配置 X-API-Key + 粘贴 OpenAPI schema
-[ ] 11. 把 PROJECT_INSTRUCTIONS.txt 放进你的 A股交易 GPT/项目规则
-
-完成后，以后聊天中不需要再把 Tushare token 发给 ChatGPT。
+[ ] Replace repo-root files with V3.2
+[ ] Do NOT copy any real token into GitHub
+[ ] Existing Netlify env TUSHARE_TOKEN remains set
+[ ] Existing Netlify env ACTION_API_KEY remains set
+[ ] git add -A
+[ ] git commit -m "Upgrade to V3.2 multi-source fallback"
+[ ] git push
+[ ] Netlify deploy is Published
+[ ] /health returns version 3.2.0
+[ ] /diagnostics/providers?ts_code=600522.SH&freq=5MIN returns provider states
+[ ] /stock/600522.SH/snapshot returns data_quality and quote_provider
+[ ] Confirm current quote source_time is sensible
+[ ] Confirm conflicting/stale provider data is marked degraded/stale
+[ ] /stock/600522.SH/intraday?freq=5MIN returns minute quality
+[ ] /market/overview returns breadth_mode/coverage
+[ ] /market/scan returns realtime candidates even if rt_k is unavailable
+[ ] /market/sentiment does not claim whole-market counts when coverage is partial
+[ ] openapi-action.yaml server points to your Netlify URL
+[ ] ChatGPT Action includes X-API-Key, never TUSHARE_TOKEN
