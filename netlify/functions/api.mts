@@ -12,7 +12,7 @@ import {
 } from "../../lib/market.js";
 import { n, s, sortNumeric, tushareQuery, TushareError, type Row } from "../../lib/tushare.js";
 
-const VERSION = "3.1.0";
+const VERSION = "3.1.1";
 const JSON_HEADERS = { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" };
 
 function json(data: unknown, status = 200) {
@@ -93,7 +93,7 @@ const TOP_INST_FIELDS = "trade_date,ts_code,exalter,side,buy,buy_rate,sell,sell_
 async function health() {
   return {
     ok: true,
-    service: "tushare-chatgpt-bridge-v3.1-netlify",
+    service: "tushare-chatgpt-bridge-v3.1.1-netlify",
     version: VERSION,
     as_of_cn: cnNow(),
     read_only: true,
@@ -182,9 +182,11 @@ async function stockSnapshot(code: string, url: URL) {
   const prevClose = rt ? n(rt.pre_close) : n(latestHist.pre_close);
   const avg5VolHands = hist.slice(-5).map(r=>n(r.vol)).filter((x):x is number=>x!==null);
   const avg5 = avg5VolHands.length ? avg5VolHands.reduce((a,b)=>a+b,0)/avg5VolHands.length : null;
-  const progress = chinaTradingProgress();
-  const currentVolHands = rt && n(rt.vol) !== null ? n(rt.vol)! / 100 : n(latestHist.vol);
-  const projected = currentVolHands !== null && progress > 0 ? currentVolHands / progress : null;
+  const progress = rt ? chinaTradingProgress() : null;
+  // Never use a completed prior-day daily volume as if it were today's intraday volume.
+  const currentVolHands = rt && n(rt.vol) !== null ? n(rt.vol)! / 100 : null;
+  const latestCompletedDailyVolHands = n(latestHist.vol);
+  const projected = currentVolHands !== null && progress !== null && progress > 0 ? currentVolHands / progress : null;
   const recent20 = frame.slice(-20);
   const highs20 = recent20.map(r=>n(r.high)).filter((x):x is number=>x!==null);
   const lows20 = recent20.map(r=>n(r.low)).filter((x):x is number=>x!==null);
@@ -203,6 +205,8 @@ async function stockSnapshot(code: string, url: URL) {
   return {
     as_of_cn: cnNow(),
     market_trade_time: rt ? s(rt.trade_time) : null,
+    data_mode: rt ? "realtime" : "latest_completed_daily_fallback",
+    quote_freshness: rt ? "realtime_rt_k" : `daily_close_${String(latestHist.trade_date || "unknown")}`,
     info: basicR.rows.at(0) || { ts_code: code },
     quote: rt || latestHist,
     price_context: {
@@ -215,11 +219,14 @@ async function stockSnapshot(code: string, url: URL) {
     },
     technicals: tech,
     volume: {
+      realtime_available: !!rt,
       current_volume_hands: currentVolHands,
+      latest_completed_daily_volume_hands: latestCompletedDailyVolHands,
       avg5_daily_volume_hands: avg5,
       trading_session_progress: progress,
       projected_full_day_volume_hands: projected,
       projected_volume_vs_5d_avg: projected !== null && avg5 ? projected / avg5 : null,
+      note: rt ? "Realtime volume pace from rt_k." : "Realtime quote unavailable; projected intraday volume fields are intentionally null.",
     },
     intraday: {
       available: !!minute.length,
@@ -337,17 +344,77 @@ async function stockRiskEvents(code: string, url: URL) {
   };
 }
 
+async function completedDailyMarketFallback() {
+  const openDate = await latestOpenDate();
+  const candidates = [openDate];
+  const prev = await previousOpenDate(openDate);
+  if (prev) candidates.push(prev);
+  for (const tradeDate of candidates) {
+    const r = await safeQuery(
+      "daily",
+      { trade_date: tradeDate },
+      "ts_code,trade_date,open,high,low,close,pre_close,change,pct_chg,vol,amount",
+    );
+    if (r.rows.length) {
+      const rows = r.rows.map(x => ({
+        ...x,
+        pct_change: n(x.pct_chg),
+        // daily.amount is thousand yuan; normalize to yuan to match rt_k semantics.
+        amount: n(x.amount) !== null ? n(x.amount)! * 1000 : null,
+        risk_name: false,
+      }));
+      return { rows, trade_date: tradeDate, error: r.error };
+    }
+  }
+  return { rows: [] as Row[], trade_date: null as string | null, error: "No completed daily market snapshot available" };
+}
+
+async function marketRowsWithFallback() {
+  try {
+    const rows = await realtimeMarket();
+    return { rows, mode: "realtime" as const, trade_date: latestOpenDate(), realtime_error: null as string | null };
+  } catch (e) {
+    const fallback = await completedDailyMarketFallback();
+    return {
+      rows: fallback.rows,
+      mode: "post_close_fallback" as const,
+      trade_date: Promise.resolve(fallback.trade_date),
+      realtime_error: e instanceof Error ? e.message : String(e),
+    };
+  }
+}
+
 async function marketOverview() {
-  const [market, idxR] = await Promise.all([
-    realtimeMarket(),
-    safeQuery("rt_idx_k", { ts_code: "000001.SH,399001.SZ,399006.SZ,000300.SH" }),
-  ]);
+  let market: Row[] = [];
+  let mode: "realtime" | "post_close_fallback" = "realtime";
+  let dataTradeDate: string | null = null;
+  let realtimeError: string | null = null;
+  try {
+    market = await realtimeMarket();
+    dataTradeDate = await latestOpenDate();
+  } catch (e) {
+    realtimeError = e instanceof Error ? e.message : String(e);
+    const fb = await completedDailyMarketFallback();
+    market = fb.rows;
+    dataTradeDate = fb.trade_date;
+    mode = "post_close_fallback";
+  }
+
+  const idxR = mode === "realtime"
+    ? await safeQuery("rt_idx_k", { ts_code: "000001.SH,399001.SZ,399006.SZ,000300.SH" })
+    : { rows: [] as Row[], error: "Realtime indices skipped because rt_k is unavailable." };
+
   const eligible = market.filter(r => !r.risk_name && n(r.close) !== null && n(r.pre_close) !== null);
   const pcts = eligible.map(r=>n(r.pct_change)).filter((x):x is number=>x!==null);
   const amount = eligible.reduce((acc,r)=>acc+(n(r.amount)||0),0);
   return {
     as_of_cn: cnNow(),
-    market_trade_time: marketTradeTime(market),
+    data_mode: mode,
+    data_trade_date: dataTradeDate,
+    freshness_note: mode === "realtime"
+      ? "Live market cross-section from rt_k."
+      : "rt_k unavailable; figures are from the latest completed daily market snapshot and are not current intraday data.",
+    market_trade_time: mode === "realtime" ? marketTradeTime(market) : null,
     indices: enrichRealtime(idxR.rows),
     breadth: {
       universe: eligible.length,
@@ -366,8 +433,8 @@ async function marketOverview() {
       top_decliners: topRows(eligible, "pct_change", 12, false),
       top_turnover: topRows(eligible, "amount", 12),
     },
-    permission_errors: { realtime_indices: idxR.error },
-    sources: ["Tushare rt_k", "Tushare rt_idx_k"],
+    permission_errors: { realtime_market: realtimeError, realtime_indices: idxR.error },
+    sources: mode === "realtime" ? ["Tushare rt_k", "Tushare rt_idx_k"] : ["Tushare daily (fallback)"],
   };
 }
 
@@ -376,7 +443,17 @@ async function marketScan(url: URL) {
   const leaderN = Math.max(1, Math.min(8, Number(url.searchParams.get("leaders_per_sector") || 4)));
   const marketTop = Math.max(5, Math.min(30, Number(url.searchParams.get("market_top_n") || 15)));
   const minAmountM = Math.max(0, Number(url.searchParams.get("min_amount_million") || 100));
-  const [market, swR] = await Promise.all([realtimeMarket(), safeQuery("rt_sw_k", {})]);
+  let market: Row[] = [];
+  let marketMode: "realtime" | "post_close_fallback" = "realtime";
+  let marketRealtimeError: string | null = null;
+  try { market = await realtimeMarket(); }
+  catch (e) {
+    marketRealtimeError = e instanceof Error ? e.message : String(e);
+    const fb = await completedDailyMarketFallback();
+    market = fb.rows;
+    marketMode = "post_close_fallback";
+  }
+  const swR = marketMode === "realtime" ? await safeQuery("rt_sw_k", {}) : { rows: [] as Row[], error: "Realtime industries skipped because rt_k is unavailable." };
   const eligible = market.filter(r => !r.risk_name && n(r.close) !== null && n(r.pre_close) !== null);
   const liquid = eligible.filter(r => (n(r.amount)||0) >= minAmountM * 1e6);
   const candidates = liquid.filter(r => (n(r.pct_change)||0)>0 && (n(r.distance_from_high_pct)||-99)>=-2)
@@ -407,7 +484,9 @@ async function marketScan(url: URL) {
 
   return {
     as_of_cn: cnNow(),
-    market_trade_time: marketTradeTime(market),
+    data_mode: marketMode,
+    freshness_note: marketMode === "realtime" ? "Live scan from rt_k." : "rt_k unavailable; market leaders are from the latest completed daily snapshot; realtime industry ranking is unavailable.",
+    market_trade_time: marketMode === "realtime" ? marketTradeTime(market) : null,
     filters: {
       min_amount_million: minAmountM,
       momentum_candidate_rule: "positive pct_change; within 2% of intraday high; turnover amount above threshold; excludes ST/退 names",
@@ -417,8 +496,8 @@ async function marketScan(url: URL) {
     top_gainers: topRows(eligible, "pct_change", marketTop),
     top_turnover: topRows(eligible, "amount", marketTop),
     liquid_momentum_candidates: candidates,
-    permission_errors: { rt_sw_k: swR.error },
-    sources: ["Tushare rt_k", "Tushare rt_sw_k", "Tushare index_member_all"],
+    permission_errors: { rt_k: marketRealtimeError, rt_sw_k: swR.error },
+    sources: marketMode === "realtime" ? ["Tushare rt_k", "Tushare rt_sw_k", "Tushare index_member_all"] : ["Tushare daily (fallback)"],
   };
 }
 
@@ -501,7 +580,20 @@ async function marketThemes(url: URL) {
 }
 
 async function marketSentiment() {
-  const [market, tradeDate] = await Promise.all([realtimeMarket(), latestOpenDate()]);
+  let market: Row[] = [];
+  let mode: "realtime" | "post_close_fallback" = "realtime";
+  let tradeDate = await latestOpenDate();
+  let realtimeError: string | null = null;
+  try {
+    market = await realtimeMarket();
+  } catch (e) {
+    realtimeError = e instanceof Error ? e.message : String(e);
+    const fb = await completedDailyMarketFallback();
+    market = fb.rows;
+    tradeDate = fb.trade_date || tradeDate;
+    mode = "post_close_fallback";
+  }
+
   const prevDate = await previousOpenDate(tradeDate);
   const [limitsR, prevStepR, strongR, kplUpR, kplBreakR, kplDownR, kplAuctionR] = await Promise.all([
     safeQuery("stk_limit", { trade_date: tradeDate }, "trade_date,ts_code,pre_close,up_limit,down_limit"),
@@ -522,7 +614,7 @@ async function marketSentiment() {
     if (row.risk_name) continue;
     const lim = lmap.get(String(row.ts_code));
     if (!lim) continue;
-    const close=n(row.close), high=n(row.high), low=n(row.low), up=n(lim.up_limit), down=n(lim.down_limit);
+    const close=n(row.close), high=n(row.high), up=n(lim.up_limit), down=n(lim.down_limit);
     if (close===null || up===null || down===null) continue;
     const eps = Math.max(0.001, close * 0.00005);
     const hitUp = high !== null && high >= up - eps;
@@ -543,7 +635,11 @@ async function marketSentiment() {
 
   return {
     as_of_cn: cnNow(),
-    market_trade_time: marketTradeTime(market),
+    data_mode: mode,
+    freshness_note: mode === "realtime"
+      ? "Current board status computed from rt_k versus official limit prices."
+      : `rt_k unavailable; board status is reconstructed from completed daily data for ${tradeDate}, not current intraday sentiment.`,
+    market_trade_time: mode === "realtime" ? marketTradeTime(market) : null,
     trade_date: tradeDate,
     realtime_temperature: {
       sealed_limit_up_count: sealedUp.length,
@@ -562,13 +658,14 @@ async function marketSentiment() {
     previous_trade_date: prevDate,
     previous_day_strong_themes: sortNumeric(strongR.rows, "rank", false).slice(0, 12),
     provider_board_lists: {
-      freshness: "kpl_provider_current_trade_date_when_available",
+      freshness: "kpl_provider_trade_date_when_available",
       limit_up: kplUpR.rows.slice(0, 80),
       opened_board: kplBreakR.rows.slice(0, 80),
       limit_down: kplDownR.rows.slice(0, 80),
       auction: kplAuctionR.rows.slice(0, 80),
     },
     permission_errors: {
+      rt_k: realtimeError,
       stk_limit: limitsR.error,
       previous_limit_step: prevStepR.error,
       previous_limit_cpt_list: strongR.error,
@@ -577,10 +674,13 @@ async function marketSentiment() {
       kpl_limit_down: kplDownR.error,
       kpl_auction: kplAuctionR.error,
     },
-    sources: ["Tushare rt_k", "Tushare stk_limit", "Tushare limit_step", "Tushare limit_cpt_list", "Tushare kpl_list"],
+    sources: mode === "realtime"
+      ? ["Tushare rt_k", "Tushare stk_limit", "Tushare limit_step", "Tushare limit_cpt_list", "Tushare kpl_list"]
+      : ["Tushare daily (fallback)", "Tushare stk_limit", "Tushare limit_step", "Tushare limit_cpt_list", "Tushare kpl_list"],
     notes: [
-      "Current sealed/failed boards are computed from realtime price/high versus today's official limit prices.",
-      "estimated_streak is inferred from the previous trading day's limit_step plus today's realtime sealed board; treat it as an estimate, not an exchange field.",
+      "Current sealed/failed boards are computed from realtime price/high versus today's official limit prices when rt_k is available.",
+      "Without rt_k, the same logic is reconstructed only for the latest completed daily session and must not be interpreted as live sentiment.",
+      "estimated_streak is inferred from the previous trading day's limit_step plus the evaluated session's sealed board; treat it as an estimate, not an exchange field.",
     ],
   };
 }

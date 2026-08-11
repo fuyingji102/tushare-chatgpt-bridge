@@ -1,4 +1,11 @@
-# Tushare → ChatGPT V3.1 (Netlify)
+# Tushare → ChatGPT V3.1.1 (Netlify)
+
+
+## V3.1.1 修复
+
+- 修复无 `rt_k` 权限时，`/stock/{code}/snapshot` 把上一交易日全天成交量误当成当前盘中成交量并做全天外推的问题。现在实时权限缺失时，盘中量能与全天预测字段明确返回 `null`。
+- `/market/overview`、`/market/scan`、`/market/sentiment` 在缺少 `rt_k` 时不再整条接口报错；会退化到**最近一个已完成交易日**的 `daily` 截面，并用 `data_mode=post_close_fallback` 和 `freshness_note` 明确标记。
+- 该 fallback 只用于保证聊天数据层可用，不能当作实时盘中数据。真正盘中讨论仍需要 `rt_k`；分钟路径仍需要 `rt_min_daily`。
 
 这是一个只读的 A 股行情数据层，目标不是自动交易，而是让 ChatGPT 在长期聊天里随时获取足够新的事实数据，再结合新闻和交易框架与你讨论行情。
 
