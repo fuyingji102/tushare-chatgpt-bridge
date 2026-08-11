@@ -1,121 +1,190 @@
+# Tushare → ChatGPT V3.2.2 (Netlify)
 
-## V3.2.1：腾讯实时交叉验证 + 全市场 fallback
-
-- 个股报价优先级：`Tushare rt_k -> Tencent -> Eastmoney -> Sina`。
-- 当 Tushare `rt_k` 没权限时，Tencent 与 Sina 可对单股现价做独立交叉验证；一致时 `data_quality.status` 可升级为 `verified`。
-- 全市场实时层：先用 Tushare `stock_basic` 定义上市股票池，再批量请求 Tencent；只有返回覆盖率 >=97% 且时间戳新鲜，才允许标记为 `coverage=full` 并计算实时上涨/下跌家数、成交额、涨跌停情绪。
-- 若 `rt_sw_k` 和 Eastmoney 行业都不可用，`market/scan` 会用 `stock_basic.industry` + 当前全市场行情计算行业成员收益中位数代理排名。该字段明确标为 proxy，不冒充申万官方指数。
-- Tencent 只作为实时传输/校验层；历史、复权、涨跌停价格、两融、资金流等仍以 Tushare 为底座。未来开通 Tushare 实时/高积分权限后会自动切回 Tushare 主源。
-
-注意：腾讯和新浪均属于公开网页行情接口，可能限流或调整。服务通过时间戳、覆盖率和多源一致性校验决定是否接受数据；无法验证时会降级，而不是静默当作准确实时值。
-
-# Tushare → ChatGPT V3.2.1 (Netlify, multi-source fallback)
-
-这是一个**只读**的 A 股行情数据层，用来让 ChatGPT 在长期聊天里获取尽可能新的事实数据，再结合新闻和交易框架讨论市场。它不是自动交易系统，没有券商连接和下单接口。
-
-## V3.2 的核心变化
-
-### 1. Tushare 永远优先，权限升级后自动启用
-
-不需要为了当前 2000 积分改掉 Tushare。每一类数据先尝试 Tushare：
+V3.2.2 在 V3.2.1 多源实时底座上增加“交易策略层”。默认审核顺序固定为：
 
 ```text
-Tushare realtime / advanced endpoint
-        ↓ success
-      use it
-        ↓ permission / timeout / unavailable
-free fallback provider
+情绪 -> 板块 -> 大盘/双创/风格指数 -> 个股
 ```
 
-因此以后开通 `rt_k`、`rt_min_daily`，或积分提高到能访问 `cyq_perf`、`kpl_list`、`limit_step` 等接口时，**不需要改 API、OpenAPI 或 ChatGPT Action**；下一次请求会自然优先使用 Tushare。
+核心战法暂时只做一套：**板块共振下的启动突破**，并按生命周期分为 B0/B1/B2/B3/FAILED。
 
-### 2. 免费实时 fallback
+## V3.2.2 新增
 
-当前加入：
+### 1. 市场情绪 Regime
 
-- 实时个股 quote：Eastmoney → Sina
-- 分钟线：Eastmoney → Sina
-- 指数：Tushare `rt_idx_k` → Eastmoney
-- 行业：Tushare `rt_sw_k` → Eastmoney industry boards
-- 概念：Tushare THS 概念 → Eastmoney concept boards/members
-- 个股资金流：`moneyflow_ths` → Tushare 标准 `moneyflow`
-- 全市场：优先 Tushare `rt_k`；Eastmoney 只有在返回覆盖足够完整时才允许用于**全市场 breadth**
-
-免费网页数据源不是交易所 SLA 服务，可能改接口、限速或暂时不可达。因此 V3.2 的原则不是“假装永远实时”，而是**不把未知质量的数据当成 verified realtime**。
-
-### 3. 实时有效性/准确性控制
-
-单股 snapshot 会返回：
+`GET /market/sentiment` 新增：
 
 ```text
-data_quality.status
-  verified   多个独立来源价格一致
-  usable     可用，但独立验证不足/时间较旧
-  degraded   来源明显冲突
-  stale      时间戳不符合当前市场阶段
-  fallback   没有可靠实时价格
+regime = ignition | expansion | climax | divergence | retreat | repair | neutral
+breakout_environment = supportive | selective | hostile
+recommended_mode
 ```
 
-同时提供：
+Regime 不是单看涨停数，而是综合上涨/下跌家数、市场中位数、>5%/<-5%、涨停/炸板/跌停结构。
 
-- `primary_source_time`
-- `primary_age_seconds`
-- `cross_checks`
-- `max_price_difference_pct`
-- `warnings`
+### 2. 全行业启动扫描
 
-分钟线也有独立 `quality`。
-
-**午休和收盘后会按市场阶段判断新鲜度**，不会因为 11:30 后没有新成交就简单把午休行情误判为坏数据。
-
-### 4. 全市场数据不允许“100只股票冒充全市场”
-
-如果免费源只返回涨幅榜/成交额榜等部分股票：
-
-- `/market/scan` 可以用于找实时候选；
-- `/market/sentiment` 的计数明确标成 `observed_lower_bound`；
-- `/market/overview` 的全市场上涨/下跌家数等 breadth 继续使用最近完成交易日，并明确标为 fallback。
-
-只有 provider 返回足够完整覆盖时，才能标记 `coverage=full`。
-
-### 5. 复权/除权日处理
-
-日线技术指标使用 Tushare qfq 历史。如果实时 `pre_close` 与最近完成日的 qfq close 因除权/除息发生尺度变化，V3.2 会先把历史 qfq 序列缩放到当前交易所 `pre_close` 基准，再加入实时 bar，避免 MA/SKDJ 因价格尺度突变失真。
-
-### 6. 量能保护
-
-只有确认 quote 的 `source_time` 属于**当前中国交易日**且未判为 stale 时，才计算：
-
-- `current_volume_hands`
-- `projected_full_day_volume_hands`
-- `projected_volume_vs_5d_avg`
-
-否则全部返回 `null`，绝不会再把昨日全天成交量当成今天午盘量。
-
-## 只需要两个环境变量
-
-Netlify：
+新增：
 
 ```text
-TUSHARE_TOKEN=你的 Tushare token
-ACTION_API_KEY=你自己生成的随机长密码
+GET /market/sectors
 ```
 
-**V3.2 没有新增 token。** Eastmoney / Sina fallback 不需要额外环境变量。
+对 Tushare `stock_basic.industry` 的全部可用行业统一计算：
 
-不要把真实 token/key 提交到 GitHub。
+- 1/3/5/10 日成员收益代理
+- 上涨比例、>3%、>5%
+- 接近日内高点比例
+- 当前成交额和相对 5 日成交扩张
+- acceleration
+- `ignition_score`
+- `IGNITION / EXPANDING / EXTENDED / NEUTRAL / WEAK`
 
-## 部署升级（从 V3.1.1）
+行业收益是**成员股 proxy**，不是申万官方指数；接口会明确标注。
 
-把 V3.2 文件覆盖 GitHub repo 根目录，然后：
+### 3. 指数矩阵
+
+`GET /market/overview` 新增 `index_matrix`：
+
+- 上证指数
+- 上证50
+- 沪深300
+- 中证500
+- 中证1000
+- 深证成指
+- 创业板指
+- 科创50
+- 科创创业50
+- 中证2000
+
+每个指数尽可能返回 realtime；没有免费实时 transport 的指数会回退到 Tushare `index_daily` 并明确 freshness。指标包括 MA5/10/20/60、距均线、5/20 日收益、日内收盘位置、量能相对 5 日。
+
+### 4. 启动突破扫描
+
+新增：
+
+```text
+GET /market/breakouts
+```
+
+阶段：
+
+```text
+B0      临界/预突破：平台收缩，接近参考前高
+B1      启动突破：突破参考前高并有量价确认
+B2      第一次回踩：突破后 1-5 日首次缩量回踩
+B3      过度延伸：趋势强但不追
+FAILED  突破失败
+WAIT    暂无结构
+```
+
+Breakout Score：
+
+```text
+Market 15
+Sector 20
+Base / Compression 15
+Breakout Quality 20
+Volume 10
+Relative Strength 10
+Liquidity 10
+- Extension Penalty
+```
+
+扫描语义刻意写清：**全 A 股进入 realtime/liquidity/sector 预筛，然后只对有限候选池拉 180 日 Tushare qfq 历史确认**。这避免假装每次请求都对 5000+ 股票完整拉 60/180 日历史。
+
+默认：
+
+```text
+scan_limit=36
+min_amount_million=150
+top_n=15
+```
+
+可调 `scan_limit` 20-60。
+
+### 5. 成交量单位保护
+
+单股 snapshot 会对 Tushare/Tencent/Eastmoney/Sina 的 `vol_hands` 做多源尺度检查。
+
+- 多源一致：`verified`
+- 某一源出现约 100x 等尺度异常：选一致集群并标 `normalized_outlier`
+- scanner 还会用 20 日历史量做第二层 100x 防护
+
+避免把 provider 单位异常误判成“126x 放量”。
+
+### 6. Signal evaluation schema
+
+Breakout candidate 会输出 `signal_record`：
+
+```text
+signal_id
+signal_stage
+signal_price
+breakout_level
+market_regime
+sector_status
+score
+evaluation_horizons_days = [1,3,5,10]
+```
+
+以及未来需要回填的：
+
+```text
+forward_return
+MFE
+MAE
+invalidation_hit
+```
+
+Netlify Function 本身无持久存储，所以 V3.2.2 只输出标准 signal record；后续如需真实回测数据库，可在 V3.3 接入持久化层。
+
+## 数据源顺序
+
+实时个股：
+
+```text
+Tushare rt_k -> Tencent -> Eastmoney -> Sina
+```
+
+分钟：
+
+```text
+Tushare rt_min_daily -> Eastmoney -> Sina
+```
+
+全市场：
+
+```text
+Tushare rt_k -> Tushare stock_basic universe + Tencent batch -> Eastmoney full attempt
+```
+
+只有覆盖率足够且时间戳符合当前交易阶段，才允许计算 `coverage=full` breadth。
+
+历史、复权、涨跌停、资金流、两融等继续以 Tushare 为底座。以后开通 Tushare realtime/高积分权限后会自动优先使用，不需要改 Action。
+
+## 环境变量
+
+仅需要：
+
+```text
+TUSHARE_TOKEN
+ACTION_API_KEY
+```
+
+不要提交真实 token/key 到 GitHub。
+
+## 部署
+
+把 V3.2.2 内容覆盖仓库根目录：
 
 ```powershell
 git add -A
-git commit -m "Upgrade to V3.2 multi-source fallback"
+git commit -m "Upgrade to V3.2.2 breakout strategy engine"
 git push
 ```
 
-Netlify 会自动重新部署。现有两个 Environment Variables 保持不变。
+Netlify 自动部署。
 
 ## 部署后测试
 
@@ -124,34 +193,23 @@ $KEY="你的ACTION_API_KEY"
 $BASE="https://tushare-chatgpt-bridge.netlify.app"
 
 curl.exe -H "X-API-Key: $KEY" "$BASE/health"
+curl.exe -H "X-API-Key: $KEY" "$BASE/market/overview"
+curl.exe -H "X-API-Key: $KEY" "$BASE/market/sentiment"
+curl.exe -H "X-API-Key: $KEY" "$BASE/market/sectors?top_n=100"
+curl.exe -H "X-API-Key: $KEY" "$BASE/market/breakouts?scan_limit=36&top_n=15"
 curl.exe -H "X-API-Key: $KEY" "$BASE/diagnostics/providers?ts_code=600522.SH&freq=5MIN"
 curl.exe -H "X-API-Key: $KEY" "$BASE/stock/600522.SH/snapshot"
-curl.exe -H "X-API-Key: $KEY" "$BASE/stock/600522.SH/intraday?freq=5MIN"
-curl.exe -H "X-API-Key: $KEY" "$BASE/market/overview"
-curl.exe -H "X-API-Key: $KEY" "$BASE/market/scan"
-curl.exe -H "X-API-Key: $KEY" "$BASE/market/sentiment"
-curl.exe -H "X-API-Key: $KEY" "$BASE/market/themes?q=光通信"
 ```
-
-### 最先看 `/diagnostics/providers`
-
-它会告诉你：
-
-- Tushare `rt_k` / `rt_min_daily` 是否有权限；
-- Netlify 出口 IP 能否访问 Eastmoney/Sina；
-- 各源延迟和时间戳；
-- 中心价格是否被独立来源验证；
-- 分钟线 fallback 是否可用。
-
-如果某免费源以后失效，诊断接口会直接暴露错误，不会静默吞掉。
 
 ## 主要接口
 
 ```text
 GET /market/overview
-GET /market/scan
-GET /market/themes?q=MLCC
 GET /market/sentiment
+GET /market/sectors
+GET /market/breakouts
+GET /market/scan
+GET /market/themes
 
 GET /stock/{code}/snapshot
 GET /stock/{code}/intraday
@@ -167,11 +225,10 @@ GET /health
 
 ## ChatGPT Action
 
-`openapi-action.yaml` 的 server 改成你的 Netlify URL，例如：
+`openapi-action.yaml` 已使用：
 
-```yaml
-servers:
-  - url: https://tushare-chatgpt-bridge.netlify.app
+```text
+https://tushare-chatgpt-bridge.netlify.app
 ```
 
 Authentication：
@@ -182,23 +239,17 @@ Custom Header: X-API-Key
 Value: ACTION_API_KEY
 ```
 
-不需要把 `TUSHARE_TOKEN` 放进 ChatGPT。
+## 默认分析纪律
 
-## 数据使用规则
+每次都按：
 
-ChatGPT 应始终：
+```text
+1 情绪
+2 全板块
+3 大盘/双创/大小盘风格
+4 个股
+```
 
-1. 先读取 `as_of_cn`、`data_mode`、`coverage` 和 `data_quality`；
-2. `stale/degraded` 时不得给出“当前已确认突破/站稳”之类精确盘中判断；
-3. `ranked_partial` 时不得把 observed count 描述成全市场总数；
-4. post-close 数据（资金流、daily_basic、margin 等）必须引用其交易日；
-5. 新闻/催化由 ChatGPT 另外实时搜索，不由行情 API 猜测。
+个股优先 B0/B1/B2；B3 明确为追高风险。SKDJ/MACD/RSI 只作为最后辅助，不覆盖价格结构、量能、板块共振和相对强度。
 
-## 安全
-
-- 只读；
-- 无券商账户；
-- 无下单；
-- 无通用 Tushare proxy；
-- `TUSHARE_TOKEN` 仅存在 Netlify 环境变量；
-- 固定接口由 `X-API-Key` 保护。
+本服务只读，无券商连接和下单功能。

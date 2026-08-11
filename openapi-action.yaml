@@ -1,14 +1,14 @@
 openapi: 3.1.0
 info:
   title: A-share Market Discussion Data
-  version: 3.2.1
+  version: 3.2.2
   description: >
-    Read-only A-share market data for ChatGPT discussion. Tushare is the preferred
-    provider; when a realtime/advanced permission is unavailable the service can
-    fall back to Tencent/Eastmoney/Sina public quote providers and returns explicit source, freshness,
-    coverage and cross-check quality fields. No brokerage or order functions.
+    Read-only A-share market data and breakout-strategy context. Tushare is preferred;
+    Tencent/Eastmoney/Sina are realtime fallbacks with explicit freshness, coverage and
+    cross-check quality. V3.2.2 adds market regime, full-industry ignition ranking,
+    style-index matrix and B0/B1/B2/B3/FAILED breakout scanning. No order functions.
 servers:
-  - url: https://REPLACE_WITH_YOUR_NETLIFY_DOMAIN
+  - url: https://tushare-chatgpt-bridge.netlify.app
 security:
   - ApiKeyAuth: []
 paths:
@@ -60,6 +60,33 @@ paths:
       responses:
         "200": { description: Market sentiment }
 
+  /market/sectors:
+    get:
+      operationId: getMarketSectors
+      summary: Rank all available industries by ignition strength, breadth and turnover expansion.
+      description: >
+        Uses the full A-share quote universe plus Tushare industry metadata and recent daily data.
+        Returns 1/3/5/10-day member-return proxies, breadth, turnover expansion and ignition status.
+      parameters:
+        - { name: top_n, in: query, required: false, schema: { type: integer, default: 100, minimum: 10, maximum: 100 } }
+        - { name: history_sessions, in: query, required: false, schema: { type: integer, default: 10, minimum: 5, maximum: 10 } }
+      responses:
+        "200": { description: Full-industry ignition ranking }
+
+  /market/breakouts:
+    get:
+      operationId: getMarketBreakouts
+      summary: Scan A-shares for B0 pre-breakout, B1 launch and B2 first-retest setups.
+      description: >
+        Starts from the full A-share realtime cross-section, then qfq-confirms a bounded candidate pool
+        with Tushare history. B3 means extended/do-not-chase; FAILED means breakout failure.
+      parameters:
+        - { name: scan_limit, in: query, required: false, schema: { type: integer, default: 36, minimum: 20, maximum: 60 } }
+        - { name: top_n, in: query, required: false, schema: { type: integer, default: 15, minimum: 5, maximum: 30 } }
+        - { name: min_amount_million, in: query, required: false, schema: { type: number, default: 150, minimum: 20 } }
+      responses:
+        "200": { description: Breakout candidates, stages, scores and execution zones }
+
   /market/scan:
     get:
       operationId: getMarketScan
@@ -96,11 +123,8 @@ paths:
       operationId: getStockSnapshot
       summary: Preferred one-call stock snapshot for current trading discussion.
       description: >
-        Tushare realtime is preferred. When unavailable, Tencent, Eastmoney, then Sina can supply realtime
-        quote/minute data. Returned data_quality contains timestamp freshness and independent quote
-        cross-checks. Daily technicals remain based on Tushare qfq history. Also includes daily_basic,
-        margin financing, post-close moneyflow with standard-moneyflow fallback, optional chip-cost,
-        and recent KPL history when permitted.
+        Current stock quote, qfq technicals, volume quality, minute status, moneyflow,
+        valuation and margin context. Tushare is preferred; Tencent/Eastmoney/Sina are fallbacks.
       parameters:
         - name: ts_code
           in: path
@@ -188,6 +212,7 @@ paths:
         "200": { description: Stock event-risk context }
 
 components:
+  schemas: {}
   securitySchemes:
     ApiKeyAuth:
       type: apiKey

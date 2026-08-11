@@ -11,13 +11,14 @@ import {
   topRows,
 } from "../../lib/market.js";
 import { n, s, sortNumeric, tushareQuery, TushareError, type Row } from "../../lib/tushare.js";
+import { analyzeBreakout, classifyRegime, clamp, median as strategyMedian, pctRank, type RegimeLabel } from "../../lib/strategy.js";
 import {
   eastmoneyBoardMembers, eastmoneyBoards, eastmoneyIndices, eastmoneyMarketFullAttempt,
   eastmoneyMarketRank, eastmoneyMinutes, eastmoneyQuote, eastmoneyQuotes, quoteConsensus,
   sinaMinutes, sinaQuote, tencentIndices, tencentQuote, tencentQuotes, tencentQuotesBatched, type ProviderResult,
 } from "../../lib/providers.js";
 
-const VERSION = "3.2.1";
+const VERSION = "3.2.2";
 const JSON_HEADERS = { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" };
 
 function json(data: unknown, status = 200) {
@@ -87,6 +88,31 @@ function numericMedian(xs: number[]): number | null {
   return a.length % 2 ? a[m] : (a[m-1] + a[m]) / 2;
 }
 
+const INDEX_DEFS = [
+  { ts_code:"000001.SH", name:"上证指数", style:"broad_main" },
+  { ts_code:"000016.SH", name:"上证50", style:"large_value" },
+  { ts_code:"000300.SH", name:"沪深300", style:"large_core" },
+  { ts_code:"000905.SH", name:"中证500", style:"mid_cap" },
+  { ts_code:"000852.SH", name:"中证1000", style:"small_mid" },
+  { ts_code:"399001.SZ", name:"深证成指", style:"shenzhen_broad" },
+  { ts_code:"399006.SZ", name:"创业板指", style:"growth" },
+  { ts_code:"000688.SH", name:"科创50", style:"star_growth" },
+  { ts_code:"931643.CSI", name:"科创创业50", style:"dual_innovation" },
+  { ts_code:"932000.CSI", name:"中证2000", style:"micro_small" },
+] as const;
+
+function consensusScalar(values:Array<{source:string;value:number|null}>, ratioTolerance=0.06){
+  const xs=values.filter(x=>x.value!==null&&Number.isFinite(x.value!)&&x.value!>=0) as Array<{source:string;value:number}>;
+  if(!xs.length)return {value:null as number|null,status:"missing",sources:[] as string[],raw:values,warning:"No provider value available."};
+  if(xs.length===1)return {value:xs[0].value,status:"single",sources:[xs[0].source],raw:values,warning:null as string|null};
+  let best:Array<{source:string;value:number}>=[];
+  for(const seed of xs){const cluster=xs.filter(x=>seed.value===0?x.value===0:Math.abs(x.value/seed.value-1)<=ratioTolerance);if(cluster.length>best.length)best=cluster;}
+  if(best.length>=2){const val=numericMedian(best.map(x=>x.value));const outliers=xs.filter(x=>!best.includes(x));return {value:val,status:outliers.length?"normalized_outlier":"verified",sources:best.map(x=>x.source),raw:values,warning:outliers.length?`Ignored provider scale/outlier values from ${outliers.map(x=>x.source).join(", ")}.`:null};}
+  const logs=xs.filter(x=>x.value>0).map(x=>Math.log10(x.value));
+  const spread=logs.length?Math.max(...logs)-Math.min(...logs):0;
+  return {value:numericMedian(xs.map(x=>x.value)),status:spread>1.5?"scale_conflict":"disagreement",sources:xs.map(x=>x.source),raw:values,warning:spread>1.5?"Provider values differ by orders of magnitude; median used only as a defensive normalization.":"Providers disagree beyond tolerance; median used."};
+}
+
 function latestRow(rows: Row[], field = "trade_date"): Row | null {
   if (!rows.length) return null;
   return [...rows].sort((a,b)=>String(a[field] || "").localeCompare(String(b[field] || ""))).at(-1) || null;
@@ -114,11 +140,11 @@ const TOP_INST_FIELDS = "trade_date,ts_code,exalter,side,buy,buy_rate,sell,sell_
 async function health() {
   return {
     ok: true,
-    service: "tushare-chatgpt-bridge-v3.2.1-netlify",
+    service: "tushare-chatgpt-bridge-v3.2.2-netlify",
     version: VERSION,
     as_of_cn: cnNow(),
     read_only: true,
-    endpoints: ["market/overview", "market/scan", "market/themes", "market/sentiment", "stock/snapshot", "stock/context", "stock/intraday", "stock/lhb", "stock/risk-events", "diagnostics/providers"],
+    endpoints: ["market/overview", "market/sentiment", "market/sectors", "market/breakouts", "market/scan", "market/themes", "stock/snapshot", "stock/context", "stock/intraday", "stock/lhb", "stock/risk-events", "diagnostics/providers"],
   };
 }
 
@@ -252,6 +278,20 @@ async function stockSnapshot(code: string, url: URL) {
   if(source!=="eastmoney"&&emQ.data)checks.push({source:"eastmoney",row:emQ.data,source_time:emQ.source_time});
   if(source!=="sina"&&sinaQ.data)checks.push({source:"sina",row:sinaQ.data,source_time:sinaQ.source_time});
   const quoteQuality=quoteConsensus(rt,checks);
+  const volumeConsensus=consensusScalar([
+    {source:"tushare_rt_k",value:tr?n(tr.vol_hands):null},
+    {source:"tencent",value:txQ.data?n(txQ.data.vol_hands):null},
+    {source:"eastmoney",value:emQ.data?n(emQ.data.vol_hands):null},
+    {source:"sina",value:sinaQ.data?n(sinaQ.data.vol_hands):null},
+  ],0.08);
+  const amountConsensus=consensusScalar([
+    {source:"tushare_rt_k",value:tr?n(tr.amount_yuan):null},
+    {source:"tencent",value:txQ.data?n(txQ.data.amount_yuan)??n(txQ.data.amount):null},
+    {source:"eastmoney",value:emQ.data?n(emQ.data.amount_yuan)??n(emQ.data.amount):null},
+    {source:"sina",value:sinaQ.data?n(sinaQ.data.amount_yuan)??n(sinaQ.data.amount):null},
+  ],0.08);
+  if(rt&&volumeConsensus.value!==null){rt.vol_hands=volumeConsensus.value;rt.vol=volumeConsensus.value;}
+  if(rt&&amountConsensus.value!==null){rt.amount_yuan=amountConsensus.value;rt.amount=amountConsensus.value;}
 
   let minuteRows=[...minR.rows].sort((a,b)=>String(a.time).localeCompare(String(b.time)));
   let minuteSource=minuteRows.length?"tushare_rt_min_daily":null as string|null;
@@ -283,7 +323,7 @@ async function stockSnapshot(code: string, url: URL) {
     data_mode:rt?(quoteQuality.status==="stale"?"stale_provider_quote":quoteQuality.status==="degraded"?"realtime_degraded":source==="tushare_rt_k"?"realtime_tushare":"realtime_multi_source_fallback"):"latest_completed_daily_fallback",
     data_quality:quoteQuality,
     info:basicR.rows.at(0)||{ts_code:code},quote:rt||latestHist,
-    quote_provider:{selected:source,tushare_rt_k_available:!!tr,tencent:{ok:txQ.ok,source_time:txQ.source_time,latency_ms:txQ.latency_ms,error:txQ.error},eastmoney:{ok:emQ.ok,source_time:emQ.source_time,latency_ms:emQ.latency_ms,error:emQ.error},sina:{ok:sinaQ.ok,source_time:sinaQ.source_time,latency_ms:sinaQ.latency_ms,error:sinaQ.error}},
+    quote_provider:{selected:source,tushare_rt_k_available:!!tr,volume_consensus:volumeConsensus,amount_consensus:amountConsensus,tencent:{ok:txQ.ok,source_time:txQ.source_time,latency_ms:txQ.latency_ms,error:txQ.error},eastmoney:{ok:emQ.ok,source_time:emQ.source_time,latency_ms:emQ.latency_ms,error:emQ.error},sina:{ok:sinaQ.ok,source_time:sinaQ.source_time,latency_ms:sinaQ.latency_ms,error:sinaQ.error}},
     price_context:{current:currentClose,previous_close:prevClose,pct_from_previous_close:currentClose!==null&&prevClose?(currentClose/prevClose-1)*100:null,...maDistances,recent_20d_high:highs20.length?Math.max(...highs20):null,recent_20d_low:lows20.length?Math.min(...lows20):null},
     technicals:tech,
     volume:{realtime_available:quoteIsTrustedCurrent,current_volume_hands:currentVolHands,latest_completed_daily_volume_hands:latestCompletedDailyVolHands,avg5_daily_volume_hands:avg5,trading_session_progress:progress,projected_full_day_volume_hands:projected,projected_volume_vs_5d_avg:projected!==null&&avg5?projected/avg5:null,note:quoteIsTrustedCurrent?`Current-session volume pace from ${source}.`:"A trusted current-session quote was not verified; projected intraday volume fields are intentionally null."},
@@ -414,11 +454,41 @@ async function preferredQuotesForCodes(codes:string[]) {
 }
 
 async function preferredIndices() {
-  const tr=await safeQuery("rt_idx_k",{ts_code:"000001.SH,399001.SZ,399006.SZ,000300.SH"});
+  const requested=INDEX_DEFS.map(x=>x.ts_code).join(",");
+  const tr=await safeQuery("rt_idx_k",{ts_code:requested});
   if(tr.rows.length){const st=marketTradeTime(tr.rows),fresh=realtimeSourceFreshness(st);if(fresh.ok)return {rows:enrichRealtime(tr.rows).map(r=>({...r,provider:"tushare_rt_idx_k"} as Row)),source:"tushare_rt_idx_k",error:null as string|null,source_time:st,source_freshness:fresh};}
   const tx=await tencentIndices();const txFresh=realtimeSourceFreshness(tx.source_time);
   if(tx.ok&&txFresh.ok)return {rows:tx.data,source:"tencent",error:tx.error,source_time:tx.source_time,permission_error:tr.error,source_freshness:txFresh};
   const em=await eastmoneyIndices();const fresh=realtimeSourceFreshness(em.source_time);return {rows:em.ok&&fresh.ok?em.data:[],source:em.ok&&fresh.ok?"eastmoney":null,error:tx.error||em.error||(!fresh.ok?`Eastmoney index snapshot rejected: ${fresh.reason}`:tr.error),source_time:em.source_time,permission_error:tr.error,source_freshness:fresh};
+}
+
+function returnFromRows(rows:Row[],days:number){
+  const xs=[...rows].sort((a,b)=>String(a.trade_date||"").localeCompare(String(b.trade_date||"")));
+  if(xs.length<2)return null;const end=n(xs.at(-1)?.close);const base=n(xs.at(-Math.min(days+1,xs.length))?.close);return end!==null&&base?(end/base-1)*100:null;
+}
+
+async function indexMatrix(prefetched?:Awaited<ReturnType<typeof preferredIndices>>) {
+  const idx=prefetched||await preferredIndices();const liveMap=new Map(idx.rows.map(r=>[String(r.ts_code),r]));
+  const {start,end}=dateRange(150);
+  const histories=await Promise.all(INDEX_DEFS.map(async def=>{
+    const h=await safeQuery("index_daily",{ts_code:def.ts_code,start_date:start,end_date:end},"ts_code,trade_date,open,high,low,close,pre_close,change,pct_chg,vol,amount");
+    return {def,h};
+  }));
+  const today=dateCompact(new Date());
+  const rows=histories.map(({def,h})=>{
+    const hist=[...h.rows].sort((a,b)=>String(a.trade_date||"").localeCompare(String(b.trade_date||""))).slice(-140);
+    const live=liveMap.get(def.ts_code)||null;
+    const liveDate=s(live?.source_time)?.slice(0,10).replaceAll("-","")||null;
+    const frame=[...hist];
+    if(live&&liveDate===today&&String(hist.at(-1)?.trade_date||"")!==today)frame.push({...live,trade_date:today});
+    const tech=indicators(frame);const current=live&&liveDate===today?n(live.close):n(hist.at(-1)?.close);
+    const high=n(live?.high)??n(hist.at(-1)?.high),low=n(live?.low)??n(hist.at(-1)?.low);
+    const dayPosition=current!==null&&high!==null&&low!==null&&high>low?(current-low)/(high-low):null;
+    const vols=hist.slice(-5).map(r=>n(r.vol)).filter((x):x is number=>x!==null);const avg5=vols.length?vols.reduce((a,b)=>a+b,0)/vols.length:null;const currentVol=live&&liveDate===today?n(live.vol_hands)??n(live.vol):n(hist.at(-1)?.vol);
+    return {ts_code:def.ts_code,name:def.name,style:def.style,current,source:live&&liveDate===today?idx.source:"Tushare index_daily",source_time:live&&liveDate===today?idx.source_time:(hist.at(-1)?.trade_date||null),freshness:live&&liveDate===today?"realtime":"completed_daily",pct_change:live&&liveDate===today?n(live.pct_change):n(hist.at(-1)?.pct_chg),high,low,intraday_close_position:dayPosition,technicals:tech,ma_distance_pct:{ma5:current!==null&&tech.ma5?(current/tech.ma5-1)*100:null,ma10:current!==null&&tech.ma10?(current/tech.ma10-1)*100:null,ma20:current!==null&&tech.ma20?(current/tech.ma20-1)*100:null,ma60:current!==null&&tech.ma60?(current/tech.ma60-1)*100:null},returns:{d5:returnFromRows(frame,5),d20:returnFromRows(frame,20)},volume:{current:currentVol,avg5,ratio_vs_5d:currentVol!==null&&avg5?currentVol/avg5:null},history_error:h.error};
+  });
+  const styleMap=Object.fromEntries(rows.map(r=>[r.name,r.pct_change]));
+  return {rows,style_relative_strength:{growth_vs_large:(n(styleMap["创业板指"])!==null&&n(styleMap["沪深300"])!==null)?n(styleMap["创业板指"])!-n(styleMap["沪深300"])!:null,star_vs_large:(n(styleMap["科创50"])!==null&&n(styleMap["沪深300"])!==null)?n(styleMap["科创50"])!-n(styleMap["沪深300"])!:null,small_vs_large:(n(styleMap["中证1000"])!==null&&n(styleMap["沪深300"])!==null)?n(styleMap["中证1000"])!-n(styleMap["沪深300"])!:null},provider:idx.source,provider_error:idx.error};
 }
 
 async function preferredIndustries(topN:number) {
@@ -470,6 +540,7 @@ async function marketRowsWithFallback() {
 async function marketOverview() {
   const live=await preferredRealtimeMarketFull();
   const idx=await preferredIndices();
+  const idxMatrix=await indexMatrix(idx);
   let breadthRows=live.rows, breadthMode="realtime_full", breadthDate=await latestOpenDate();
   let fallbackError:string|null=null;
   if(!breadthRows.length){const fb=await completedDailyMarketFallback();breadthRows=fb.rows;breadthMode="post_close_breadth_fallback";breadthDate=fb.trade_date||breadthDate;fallbackError=fb.error;}
@@ -481,7 +552,7 @@ async function marketOverview() {
   return {as_of_cn:cnNow(),data_mode:live.rows.length?`realtime_${live.source}`:realtimeAvailable?"mixed_realtime_plus_post_close_breadth":"post_close_fallback",data_trade_date:breadthDate,
     freshness:{market_breadth:breadthMode,indices:idx.rows.length?"realtime":"unavailable",leaders:leadersSource,market_source_time:live.source_time,index_source_time:idx.source_time},
     data_quality:{status:live.rows.length&&idx.rows.length?"verified_market_sources":realtimeAvailable?"usable_mixed":"fallback",warnings:[...(live.rows.length?[]:["Full realtime market breadth is unavailable; breadth statistics are from the latest completed session."]),...(live.coverage==="ranked_partial"?["Eastmoney full-market response was incomplete and was not used for breadth."]:[])]},
-    indices:idx.rows,
+    indices:idx.rows,index_matrix:idxMatrix,
     breadth:{freshness:breadthMode,universe:eligible.length,advancers:pcts.filter(x=>x>0).length,decliners:pcts.filter(x=>x<0).length,flat:pcts.filter(x=>Math.abs(x)<1e-12).length,above_5pct:pcts.filter(x=>x>=5).length,below_minus_5pct:pcts.filter(x=>x<=-5).length,above_9_5pct:pcts.filter(x=>x>=9.5).length,below_minus_9_5pct:pcts.filter(x=>x<=-9.5).length,median_pct_change:numericMedian(pcts),total_turnover_yuan:amount},
     leaders:{freshness:leadersSource,top_gainers:topG,top_decliners:topD,top_turnover:topA},
     provider_errors:{realtime_market:live.provider_errors,realtime_indices:idx.error,post_close_fallback:fallbackError},sources:[live.source,idx.source,leadersSource].filter(Boolean)};
@@ -497,6 +568,109 @@ function industryProxy(rows:Row[], topN:number) {
     sectors.push({ts_code:`IND:${industry}`,symbol:`IND:${industry}`,name:industry,pct_change:median,pct_chg:median,mean_pct_change:mean,median_pct_change:median,advancers:adv,decliners:pcts.filter(x=>x<0).length,advancer_ratio:adv/pcts.length,member_count:pcts.length,amount:xs.reduce((a,r)=>a+(n(r.amount)||0),0),provider:"tushare_stock_basic+realtime_member_proxy",proxy_method:"median member pct_change; not an official industry index"});
   }
   return sectors.sort((a,b)=>(n(b.pct_change)||-999)-(n(a.pct_change)||-999)||(n(b.advancer_ratio)||0)-(n(a.advancer_ratio)||0)).slice(0,topN);
+}
+
+function compoundReturns(xs:number[],days:number){
+  const a=xs.slice(-days);if(!a.length)return null;return (a.reduce((acc,x)=>acc*(1+x/100),1)-1)*100;
+}
+
+function inferMarketRegimeFromRows(rows:Row[]){
+  const pcts=rows.filter(r=>!r.risk_name).map(r=>n(r.pct_change)).filter((x):x is number=>x!==null);
+  return classifyRegime({advancers:pcts.filter(x=>x>0).length,decliners:pcts.filter(x=>x<0).length,medianPct:numericMedian(pcts),above5:pcts.filter(x=>x>=5).length,below5:pcts.filter(x=>x<=-5).length});
+}
+
+async function sectorEngineData(historySessions=10){
+  const live=await preferredRealtimeMarketFull();let marketRows=[...live.rows],marketSource=live.source,coverage=live.coverage,tradeDate=await latestOpenDate(),fallbackError:string|null=null;
+  if(!marketRows.length){const fb=await completedDailyMarketFallback();marketRows=fb.rows;tradeDate=fb.trade_date||tradeDate;marketSource="post_close_daily";coverage="full";fallbackError=fb.error;}
+  const basic=await safeQuery("stock_basic",{list_status:"L"},"ts_code,name,industry,market,exchange,list_date");
+  const meta=new Map(basic.rows.map(r=>[String(r.ts_code),r]));
+  const enriched=marketRows.map(r=>({...meta.get(String(r.ts_code)),...r} as Row)).filter(r=>String(r.industry||"").trim());
+  const dates=await recentOpenDates(Math.max(5,Math.min(12,historySessions+1)));
+  const dailyResults=await Promise.all(dates.map(async d=>({date:d,result:await safeQuery("daily",{trade_date:d},"ts_code,trade_date,pct_chg,amount")})));
+  const byIndustryDate=new Map<string,Map<string,{median:number|null;amount:number;members:number}>>();
+  for(const {date,result} of dailyResults){
+    const groups=new Map<string,Row[]>();
+    for(const r of result.rows){const ind=String(meta.get(String(r.ts_code))?.industry||"").trim();if(!ind)continue;const xs=groups.get(ind)||[];xs.push(r);groups.set(ind,xs);}
+    for(const [ind,xs] of groups){const p=xs.map(r=>n(r.pct_chg)).filter((x):x is number=>x!==null);if(!byIndustryDate.has(ind))byIndustryDate.set(ind,new Map());byIndustryDate.get(ind)!.set(date,{median:numericMedian(p),amount:xs.reduce((a,r)=>a+(n(r.amount)||0)*1000,0),members:p.length});}
+  }
+  const groups=new Map<string,Row[]>();for(const r of enriched){if(r.risk_name||n(r.pct_change)===null)continue;const ind=String(r.industry||"").trim();const xs=groups.get(ind)||[];xs.push(r);groups.set(ind,xs);}
+  const totalAmount=enriched.reduce((a,r)=>a+(n(r.amount)||0),0);
+  const raw:any[]=[];
+  for(const [industry,xs] of groups){
+    const pcts=xs.map(r=>n(r.pct_change)).filter((x):x is number=>x!==null);if(pcts.length<3)continue;
+    const ret1=numericMedian(pcts);const dateMap=byIndustryDate.get(industry)||new Map();
+    const priorSeries=[...dateMap.entries()].filter(([d])=>d!==tradeDate).sort((a,b)=>a[0].localeCompare(b[0])).map(([,v])=>v.median).filter((x):x is number=>x!==null);
+    const series=[...priorSeries, ...(ret1!==null?[ret1]:[])];
+    const amountNow=xs.reduce((a,r)=>a+(n(r.amount)||0),0);
+    const priorAmounts=[...dateMap.entries()].filter(([d])=>d!==tradeDate).sort((a,b)=>a[0].localeCompare(b[0])).map(([,v])=>v.amount).filter(x=>x>0);
+    const avg5Amount=strategyMedian(priorAmounts.slice(-5));
+    const adv=pcts.filter(x=>x>0).length,nearHigh=xs.filter(r=>(n(r.distance_from_high_pct)||-99)>=-2).length;
+    raw.push({industry,ts_code:`IND:${industry}`,member_count:pcts.length,return_1d_pct:ret1,return_3d_pct:compoundReturns(series,3),return_5d_pct:compoundReturns(series,5),return_10d_pct:compoundReturns(series,10),advancers:adv,decliners:pcts.filter(x=>x<0).length,advancer_ratio:adv/pcts.length,above_3pct_ratio:pcts.filter(x=>x>=3).length/pcts.length,above_5pct_ratio:pcts.filter(x=>x>=5).length/pcts.length,near_intraday_high_ratio:nearHigh/pcts.length,total_amount_yuan:amountNow,turnover_share:totalAmount?amountNow/totalAmount:null,turnover_ratio_vs_5d:avg5Amount?amountNow/avg5Amount:null,acceleration_pct_per_day:ret1!==null&&compoundReturns(series,5)!==null?ret1-compoundReturns(series,5)!/5:null,provider:"tushare_stock_basic+realtime_member_proxy"});
+  }
+  const vals=(k:string)=>raw.map(x=>n(x[k])).filter((v):v is number=>v!==null);
+  const ret1s=vals("return_1d_pct"),advrs=vals("advancer_ratio"),nearhs=vals("near_intraday_high_ratio"),turns=vals("turnover_ratio_vs_5d"),accs=vals("acceleration_pct_per_day");
+  const sectors=raw.map(x=>{
+    const ret5=n(x.return_5d_pct),ret10=n(x.return_10d_pct),r1=n(x.return_1d_pct);
+    const score=clamp(100*(0.26*pctRank(r1,ret1s)+0.24*pctRank(n(x.advancer_ratio),advrs)+0.16*pctRank(n(x.near_intraday_high_ratio),nearhs)+0.14*pctRank(n(x.turnover_ratio_vs_5d),turns)+0.20*pctRank(n(x.acceleration_pct_per_day),accs)));
+    const extended=(ret5!==null&&ret5>=12)||(ret10!==null&&ret10>=20)||(r1!==null&&r1>=6);
+    const status=extended?"EXTENDED":score>=75&&(r1??0)>0?"IGNITION":score>=62&&(n(x.return_3d_pct)??0)>0?"EXPANDING":(r1??0)<0&&n(x.advancer_ratio)!<0.4?"WEAK":"NEUTRAL";
+    return {...x,ignition_score:score,status,breakout_readiness:status==="IGNITION"?"B1_candidates_priority":status==="EXPANDING"?"B1_or_B2":status==="EXTENDED"?"prefer_B2_do_not_chase":"selective"};
+  }).sort((a,b)=>(n(b.ignition_score)||0)-(n(a.ignition_score)||0));
+  return {as_of_cn:cnNow(),trade_date:tradeDate,market_source:marketSource,coverage,market_rows:enriched,sectors,sector_map:new Map(sectors.map(x=>[x.industry,x])),provider_errors:{market:live.provider_errors,stock_basic:basic.error,daily_history:dailyResults.map(x=>({trade_date:x.date,error:x.result.error})).filter(x=>x.error),fallback:fallbackError},notes:["Sector strength is a member-return proxy based on Tushare stock_basic industry labels, not an official Shenwan index return.","V3.2.2 ranks ignition using breadth, current return, acceleration, proximity to intraday highs and turnover expansion; EXTENDED sectors are deliberately penalized for chase risk."]};
+}
+
+async function marketSectors(url:URL){
+  const topN=Math.max(10,Math.min(100,Number(url.searchParams.get("top_n")||100)));const h=Math.max(5,Math.min(10,Number(url.searchParams.get("history_sessions")||10)));
+  const data=await sectorEngineData(h);
+  return {as_of_cn:data.as_of_cn,trade_date:data.trade_date,data_mode:data.coverage==="full"?`full_market_${data.market_source}`:"partial",coverage:data.coverage,sectors:data.sectors.slice(0,topN),ranking_method:"ignition_score",provider_errors:data.provider_errors,notes:data.notes};
+}
+
+async function fetchBreakoutHistory(code:string,days=170){
+  const {start,end}=dateRange(days);
+  const [d,a]=await Promise.all([safeQuery("daily",{ts_code:code,start_date:start,end_date:end},"ts_code,trade_date,open,high,low,close,pre_close,change,pct_chg,vol,amount"),safeQuery("adj_factor",{ts_code:code,start_date:start,end_date:end},"ts_code,trade_date,adj_factor")]);
+  return {rows:qfqDaily(d.rows,a.rows),errors:{daily:d.error,adj_factor:a.error}};
+}
+
+function breakoutPrefilter(rows:Row[],sectorMap:Map<string,any>,limit:number,minAmountYuan:number){
+  const eligible=rows.filter(r=>!r.risk_name&&n(r.close)!==null&&n(r.pre_close)!==null&&(n(r.amount)||0)>=minAmountYuan&&(n(r.pct_change)||0)>-2.5&&(n(r.pct_change)||0)<12);
+  const amounts=eligible.map(r=>Math.log10(Math.max(1,n(r.amount)||1))),pcts=eligible.map(r=>n(r.pct_change)||0),near=eligible.map(r=>n(r.distance_from_high_pct)||-10);
+  const scored=eligible.map(r=>{const industry=String(r.industry||"");const sec=sectorMap.get(industry);const sectorScore=n(sec?.ignition_score)||50;const pct=n(r.pct_change)||0,dist=n(r.distance_from_high_pct)||-10,amt=Math.log10(Math.max(1,n(r.amount)||1));const pre=100*(0.26*pctRank(pct,pcts)+0.22*pctRank(amt,amounts)+0.18*pctRank(dist,near)+0.34*(sectorScore/100));return {...r,prefilter_score:pre,sector_ignition_score:sectorScore,sector_status:sec?.status||"UNKNOWN"} as Row;}).sort((a,b)=>(n(b.prefilter_score)||0)-(n(a.prefilter_score)||0));
+  const chosen=new Map<string,Row>();
+  const bySector=new Map<string,Row[]>();for(const r of scored){const ind=String(r.industry||"UNKNOWN");const xs=bySector.get(ind)||[];xs.push(r);bySector.set(ind,xs);}
+  for(const xs of bySector.values()){const r=xs[0];if(r)chosen.set(String(r.ts_code),r);}
+  for(const r of scored){if(chosen.size>=limit)break;chosen.set(String(r.ts_code),r);}
+  return {eligible_count:eligible.length,rows:[...chosen.values()].sort((a,b)=>(n(b.prefilter_score)||0)-(n(a.prefilter_score)||0)).slice(0,limit)};
+}
+
+async function marketBreakouts(url:URL){
+  const scanLimit=Math.max(20,Math.min(60,Number(url.searchParams.get("scan_limit")||36)));
+  const topN=Math.max(5,Math.min(30,Number(url.searchParams.get("top_n")||15)));
+  const minAmountM=Math.max(20,Number(url.searchParams.get("min_amount_million")||150));const minAmountYuan=minAmountM*1e6;
+  const sectorData=await sectorEngineData(10);const marketRows=sectorData.market_rows;const regime=inferMarketRegimeFromRows(marketRows);
+  const pre=breakoutPrefilter(marketRows,sectorData.sector_map,scanLimit,minAmountYuan);
+  const results:any[]=[];const historyErrors:any[]=[];
+  const concurrency=6;
+  for(let i=0;i<pre.rows.length;i+=concurrency){
+    const batch=pre.rows.slice(i,i+concurrency);
+    const out=await Promise.all(batch.map(async live=>{
+      const code=String(live.ts_code||"");const hist=await fetchBreakoutHistory(code,180);
+      if(!hist.rows.length){historyErrors.push({ts_code:code,...hist.errors});return null;}
+      const sector=sectorData.sector_map.get(String(live.industry||""));
+      const a=analyzeBreakout({history:hist.rows,live,marketScore:regime.score,marketRegime:regime.regime as RegimeLabel,sectorScore:n(sector?.ignition_score)||50,sectorReturnPct:n(sector?.return_1d_pct),sectorStatus:String(sector?.status||"UNKNOWN"),minAmountYuan});
+      return a?{...a,prefilter_score:n(live.prefilter_score),quote_source:sectorData.market_source}:null;
+    }));
+    results.push(...out.filter(Boolean));
+  }
+  const stageOrder:Record<string,number>={B1:0,B2:1,B0:2,WAIT:3,B3:4,FAILED:5};
+  results.sort((a,b)=>(stageOrder[a.stage]??9)-(stageOrder[b.stage]??9)||(n(b.score)||0)-(n(a.score)||0));
+  const actionable=results.filter(x=>["B0","B1","B2"].includes(x.stage)&&(n(x.score)||0)>=60).sort((a,b)=>(n(b.score)||0)-(n(a.score)||0)).slice(0,topN);
+  const extended=results.filter(x=>x.stage==="B3").sort((a,b)=>(n(b.score)||0)-(n(a.score)||0)).slice(0,10);const failed=results.filter(x=>x.stage==="FAILED").slice(0,10);
+  const counts:Record<string,number>={};for(const r of results)counts[r.stage]=(counts[r.stage]||0)+1;
+  return {as_of_cn:cnNow(),trade_date:sectorData.trade_date,data_mode:`${sectorData.coverage}_market_prefilter_then_history_confirm`,coverage:{market_cross_section:sectorData.coverage,prefilter_universe:pre.eligible_count,historical_confirmed:results.length,scan_limit:scanLimit,semantics:"All A-shares enter the realtime/liquidity/sector prefilter; only the selected prefilter pool receives 180-day qfq history confirmation. This avoids falsely claiming a 60-day historical scan of every symbol."},
+    strategy:{name:"启动突破",stages:{B0:"pre-breakout/compression near reference high",B1:"launch breakout",B2:"first retest after breakout",B3:"extended/do not chase",FAILED:"failed breakout",WAIT:"no setup"},market_regime:regime,ranking:"Breakout Score = market 15 + sector 20 + base 15 + breakout 20 + volume 10 + relative strength 10 + liquidity 10 - extension penalty"},
+    sector_leaders:sectorData.sectors.slice(0,12),stage_counts:counts,actionable_candidates:actionable,extended_do_not_chase:extended,failed_breakouts:failed,all_confirmed:results.slice(0,Math.min(40,results.length)),
+    evaluation_schema:{persist_externally:false,note:"Netlify functions are stateless. signal_record is emitted per candidate so a future database/log sink can evaluate signals.",horizons_days:[1,3,5,10],metrics:["forward_return","MFE","MAE","invalidation_hit"]},
+    provider_errors:{...sectorData.provider_errors,history:historyErrors},notes:[...sectorData.notes,"B0/B1/B2 are the preferred lifecycle; B3 is explicitly a chase-risk state, not a recommendation.","Historical confirmation uses Tushare daily + adj_factor (qfq)."]};
 }
 
 async function marketScan(url: URL) {
@@ -571,7 +745,8 @@ async function marketSentiment() {
   const lmap=new Map(limitsR.rows.map(r=>[String(r.ts_code),r])),kplMap=new Map([...kplUpR.rows,...kplBreakR.rows,...kplDownR.rows].map(r=>[String(r.ts_code),r])),prevStreak=new Map(prevStepR.rows.map(r=>[String(r.ts_code),Number(r.nums)||1]));const sealedUp:Row[]=[],openedBoard:Row[]=[],sealedDown:Row[]=[];
   for(const row of market){if(row.risk_name)continue;const lim=lmap.get(String(row.ts_code));if(!lim)continue;const close=n(row.close),high=n(row.high),up=n(lim.up_limit),down=n(lim.down_limit);if(close===null||up===null||down===null)continue;const eps=Math.max(0.001,close*0.00005),hitUp=high!==null&&high>=up-eps,isUp=close>=up-eps,isDown=close<=down+eps;if(isUp)sealedUp.push({...row,up_limit:up,estimated_streak:(prevStreak.get(String(row.ts_code))||0)+1,kpl:kplMap.get(String(row.ts_code))||null});else if(hitUp)openedBoard.push({...row,up_limit:up,kpl:kplMap.get(String(row.ts_code))||null});if(isDown)sealedDown.push({...row,down_limit:down,kpl:kplMap.get(String(row.ts_code))||null});}
   const ladder:Record<string,number>={};for(const r of sealedUp){const k=String(r.estimated_streak||1);ladder[k]=(ladder[k]||0)+1;}const pcts=market.filter(r=>!r.risk_name).map(r=>n(r.pct_change)).filter((x):x is number=>x!==null),maxStreak=sealedUp.reduce((m,r)=>Math.max(m,Number(r.estimated_streak)||1),0);
-  return {as_of_cn:cnNow(),data_mode:mode,coverage,count_semantics:coverage==="full"?"whole_market":"observed_lower_bound",freshness_note:mode.startsWith("realtime")?"Board status computed from available realtime quotes versus official Tushare limit prices.":`Board status reconstructed from completed daily data for ${tradeDate}.`,trade_date:tradeDate,
+  const regime=classifyRegime({advancers:pcts.filter(x=>x>0).length,decliners:pcts.filter(x=>x<0).length,medianPct:numericMedian(pcts),above5:pcts.filter(x=>x>=5).length,below5:pcts.filter(x=>x<=-5).length,sealedUp:sealedUp.length,opened:openedBoard.length,sealedDown:sealedDown.length});
+  return {as_of_cn:cnNow(),data_mode:mode,coverage,count_semantics:coverage==="full"?"whole_market":"observed_lower_bound",freshness_note:mode.startsWith("realtime")?"Board status computed from available realtime quotes versus official Tushare limit prices.":`Board status reconstructed from completed daily data for ${tradeDate}.`,trade_date:tradeDate,regime,
     realtime_temperature:{sealed_limit_up_count:sealedUp.length,opened_limit_up_board_count:openedBoard.length,sealed_limit_down_count:sealedDown.length,above_5pct_count:pcts.filter(x=>x>=5).length,below_minus_5pct_count:pcts.filter(x=>x<=-5).length,advancers:pcts.filter(x=>x>0).length,decliners:pcts.filter(x=>x<0).length,max_estimated_streak:maxStreak,estimated_streak_ladder:ladder},sealed_limit_up:sortNumeric(sealedUp,"estimated_streak",true).slice(0,40),opened_boards:sortNumeric(openedBoard,"pct_change",true).slice(0,30),sealed_limit_down:sortNumeric(sealedDown,"pct_change",false).slice(0,30),previous_trade_date:prevDate,previous_day_strong_themes:sortNumeric(strongR.rows,"rank",false).slice(0,12),provider_board_lists:{freshness:"kpl_provider_trade_date_when_available",limit_up:kplUpR.rows.slice(0,80),opened_board:kplBreakR.rows.slice(0,80),limit_down:kplDownR.rows.slice(0,80),auction:kplAuctionR.rows.slice(0,80)},
     permission_errors:{rt_k:full.provider_errors.tushare,stk_limit:limitsR.error,previous_limit_step:prevStepR.error,previous_limit_cpt_list:strongR.error,kpl_limit_up:kplUpR.error,kpl_opened_board:kplBreakR.error,kpl_limit_down:kplDownR.error,kpl_auction:kplAuctionR.error},provider_errors:{eastmoney:full.provider_errors.eastmoney},sources:[full.source||mode,"Tushare stk_limit","Tushare limit_step","Tushare limit_cpt_list","Tushare kpl_list"],notes:[partialWarning,"Tushare realtime is always preferred. Free realtime providers are only fallbacks.","If realtime coverage is partial, counts are explicitly labeled lower bounds rather than whole-market totals.","estimated_streak uses Tushare limit_step when available; without that permission it should not be treated as an authoritative streak count."].filter(Boolean)};
 }
@@ -598,6 +773,8 @@ export default async (req: Request, context: any) => {
     if (path === "/market/scan") return json(await marketScan(url));
     if (path === "/market/themes") return json(await marketThemes(url));
     if (path === "/market/sentiment") return json(await marketSentiment());
+    if (path === "/market/sectors") return json(await marketSectors(url));
+    if (path === "/market/breakouts") return json(await marketBreakouts(url));
     if (path === "/diagnostics/providers") return json(await providerDiagnostics(url));
 
     const match = path.match(/^\/stock\/([^/]+)\/(snapshot|context|intraday|daily|moneyflow|lhb|risk-events)$/);
@@ -630,6 +807,8 @@ export const config = {
     "/market/scan",
     "/market/themes",
     "/market/sentiment",
+    "/market/sectors",
+    "/market/breakouts",
     "/diagnostics/providers",
     "/stock/:ts_code/snapshot",
     "/stock/:ts_code/context",

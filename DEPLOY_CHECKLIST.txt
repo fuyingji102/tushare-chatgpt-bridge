@@ -1,21 +1,22 @@
-Tushare ChatGPT Bridge V3.2.1 — upgrade checklist
+Tushare ChatGPT Bridge V3.2.2 — upgrade checklist
 
-[ ] Replace repo-root files with V3.2.1
+[ ] Replace repo-root files with V3.2.2
 [ ] Do NOT copy any real token into GitHub
-[ ] Existing Netlify env TUSHARE_TOKEN remains set
-[ ] Existing Netlify env ACTION_API_KEY remains set
+[ ] Existing Netlify TUSHARE_TOKEN remains set
+[ ] Existing Netlify ACTION_API_KEY remains set
 [ ] git add -A
-[ ] git commit -m "Upgrade to V3.2.1 multi-source fallback"
+[ ] git commit -m "Upgrade to V3.2.2 breakout strategy engine"
 [ ] git push
 [ ] Netlify deploy is Published
-[ ] /health returns version 3.2.0
-[ ] /diagnostics/providers?ts_code=600522.SH&freq=5MIN returns provider states
-[ ] /stock/600522.SH/snapshot returns data_quality and quote_provider
-[ ] Confirm current quote source_time is sensible
-[ ] Confirm conflicting/stale provider data is marked degraded/stale
-[ ] /stock/600522.SH/intraday?freq=5MIN returns minute quality
-[ ] /market/overview returns breadth_mode/coverage
-[ ] /market/scan returns realtime candidates even if rt_k is unavailable
-[ ] /market/sentiment does not claim whole-market counts when coverage is partial
-[ ] openapi-action.yaml server points to your Netlify URL
-[ ] ChatGPT Action includes X-API-Key, never TUSHARE_TOKEN
+[ ] /health returns version 3.2.2
+[ ] /diagnostics/providers confirms realtime quote sources
+[ ] /stock/600522.SH/snapshot includes volume_consensus / amount_consensus
+[ ] /market/overview includes index_matrix
+[ ] index_matrix includes 创业板指 + 科创50 and marks unavailable realtime indices as completed_daily
+[ ] /market/sentiment includes regime + breakout_environment
+[ ] /market/sectors returns all available industries with ignition_score/status
+[ ] /market/breakouts returns B0/B1/B2/B3/FAILED lifecycle fields
+[ ] Breakout response coverage says full-market prefilter + bounded qfq historical confirmation
+[ ] B3 candidates are not labeled actionable
+[ ] openapi-action.yaml validates in GPT Builder
+[ ] ChatGPT Action still uses X-API-Key and never TUSHARE_TOKEN

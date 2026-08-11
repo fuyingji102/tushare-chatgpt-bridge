@@ -235,8 +235,10 @@ export async function tencentQuotesBatched(tsCodes:string[], chunkSize=90, concu
   return {ok:rows.length>0,source:"tencent",data:rows,fetched_at_cn:fetched,source_time:sourceTime,latency_ms:Date.now()-started,error:errors.length?`${errors.length}/${results.length} Tencent batches failed; coverage ${(ratio*100).toFixed(1)}%`:null,coverage:ratio>=0.97?"full":"ranked_partial",total_reported:codes.length};
 }
 
+export const CORE_INDEX_CODES = ["000001.SH","000016.SH","000300.SH","000905.SH","000852.SH","399001.SZ","399006.SZ","000688.SH"] as const;
+
 export async function tencentIndices():Promise<ProviderResult<Row[]>>{
-  return tencentQuotes(["000001.SH","399001.SZ","399006.SZ","000300.SH"]);
+  return tencentQuotes([...CORE_INDEX_CODES]);
 }
 export async function sinaQuote(tsCode: string): Promise<ProviderResult<Row | null>> {
   const key = `sina:q:${tsCode}`;
@@ -396,5 +398,5 @@ export async function eastmoneyBoardMembers(boardCode:string,count=500):Promise<
 }
 
 export async function eastmoneyIndices():Promise<ProviderResult<Row[]>>{
-  return eastmoneyQuotes(["000001.SH","399001.SZ","399006.SZ","000300.SH"]);
+  return eastmoneyQuotes([...CORE_INDEX_CODES]);
 }
