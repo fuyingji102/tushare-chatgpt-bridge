@@ -1,4 +1,15 @@
-# Tushare → ChatGPT V3.2 (Netlify, multi-source fallback)
+
+## V3.2.1：腾讯实时交叉验证 + 全市场 fallback
+
+- 个股报价优先级：`Tushare rt_k -> Tencent -> Eastmoney -> Sina`。
+- 当 Tushare `rt_k` 没权限时，Tencent 与 Sina 可对单股现价做独立交叉验证；一致时 `data_quality.status` 可升级为 `verified`。
+- 全市场实时层：先用 Tushare `stock_basic` 定义上市股票池，再批量请求 Tencent；只有返回覆盖率 >=97% 且时间戳新鲜，才允许标记为 `coverage=full` 并计算实时上涨/下跌家数、成交额、涨跌停情绪。
+- 若 `rt_sw_k` 和 Eastmoney 行业都不可用，`market/scan` 会用 `stock_basic.industry` + 当前全市场行情计算行业成员收益中位数代理排名。该字段明确标为 proxy，不冒充申万官方指数。
+- Tencent 只作为实时传输/校验层；历史、复权、涨跌停价格、两融、资金流等仍以 Tushare 为底座。未来开通 Tushare 实时/高积分权限后会自动切回 Tushare 主源。
+
+注意：腾讯和新浪均属于公开网页行情接口，可能限流或调整。服务通过时间戳、覆盖率和多源一致性校验决定是否接受数据；无法验证时会降级，而不是静默当作准确实时值。
+
+# Tushare → ChatGPT V3.2.1 (Netlify, multi-source fallback)
 
 这是一个**只读**的 A 股行情数据层，用来让 ChatGPT 在长期聊天里获取尽可能新的事实数据，再结合新闻和交易框架讨论市场。它不是自动交易系统，没有券商连接和下单接口。
 

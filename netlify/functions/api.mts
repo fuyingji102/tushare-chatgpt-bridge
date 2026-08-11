@@ -14,10 +14,10 @@ import { n, s, sortNumeric, tushareQuery, TushareError, type Row } from "../../l
 import {
   eastmoneyBoardMembers, eastmoneyBoards, eastmoneyIndices, eastmoneyMarketFullAttempt,
   eastmoneyMarketRank, eastmoneyMinutes, eastmoneyQuote, eastmoneyQuotes, quoteConsensus,
-  sinaMinutes, sinaQuote, type ProviderResult,
+  sinaMinutes, sinaQuote, tencentIndices, tencentQuote, tencentQuotes, tencentQuotesBatched, type ProviderResult,
 } from "../../lib/providers.js";
 
-const VERSION = "3.2.0";
+const VERSION = "3.2.1";
 const JSON_HEADERS = { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" };
 
 function json(data: unknown, status = 200) {
@@ -114,7 +114,7 @@ const TOP_INST_FIELDS = "trade_date,ts_code,exalter,side,buy,buy_rate,sell,sell_
 async function health() {
   return {
     ok: true,
-    service: "tushare-chatgpt-bridge-v3.2-netlify",
+    service: "tushare-chatgpt-bridge-v3.2.1-netlify",
     version: VERSION,
     as_of_cn: cnNow(),
     read_only: true,
@@ -172,16 +172,17 @@ async function preferredFreeMinutes(code:string,freq:string) {
 }
 
 async function preferredQuote(code:string, tushareRtRows:Row[]) {
-  const [em,sina]=await Promise.all([eastmoneyQuote(code),sinaQuote(code)]);
+  const [tx,em,sina]=await Promise.all([tencentQuote(code),eastmoneyQuote(code),sinaQuote(code)]);
   const tr=normalizeTushareRealtimeQuote(tushareRtRows.at(0)||null);
-  const primary=tr || em.data || sina.data || null;
-  const primarySource=tr?"tushare_rt_k":em.data?"eastmoney":sina.data?"sina":null;
+  const primary=tr || tx.data || em.data || sina.data || null;
+  const primarySource=tr?"tushare_rt_k":tx.data?"tencent":em.data?"eastmoney":sina.data?"sina":null;
   if(primary) primary.provider=primarySource;
   const checks:Array<{source:string;row:Row|null;source_time?:string|null}>=[];
+  if(primarySource!=="tencent"&&tx.data)checks.push({source:"tencent",row:tx.data,source_time:tx.source_time});
   if(primarySource!=="eastmoney"&&em.data)checks.push({source:"eastmoney",row:em.data,source_time:em.source_time});
   if(primarySource!=="sina"&&sina.data)checks.push({source:"sina",row:sina.data,source_time:sina.source_time});
   const quality=quoteConsensus(primary,checks);
-  return {row:primary,source:primarySource,quality,free:{eastmoney:em,sina},tushare_available:!!tr};
+  return {row:primary,source:primarySource,quality,free:{tencent:tx,eastmoney:em,sina},tushare_available:!!tr};
 }
 
 async function stockIntraday(code: string, url: URL) {
@@ -228,7 +229,7 @@ async function stockSnapshot(code: string, url: URL) {
   const days = Math.max(80, Math.min(500, Number(url.searchParams.get("daily_days") || 180)));
   const { start, end } = dateRange(days);
 
-  const [basicR,dailyR,adjR,rtR,minR,flowThsR,dailyBasicR,marginR,cyqR,kplR,emQ,sinaQ] = await Promise.all([
+  const [basicR,dailyR,adjR,rtR,minR,flowThsR,dailyBasicR,marginR,cyqR,kplR,txQ,emQ,sinaQ] = await Promise.all([
     safeQuery("stock_basic", { ts_code: code, list_status: "L" }, "ts_code,symbol,name,area,industry,market,exchange,list_date"),
     safeQuery("daily", { ts_code: code, start_date: start, end_date: end }, "ts_code,trade_date,open,high,low,close,pre_close,change,pct_chg,vol,amount"),
     safeQuery("adj_factor", { ts_code: code, start_date: start, end_date: end }, "ts_code,trade_date,adj_factor"),
@@ -238,15 +239,16 @@ async function stockSnapshot(code: string, url: URL) {
     safeQuery("margin_detail", { ts_code: code, start_date: start, end_date: end }, MARGIN_FIELDS),
     safeQuery("cyq_perf", { ts_code: code, start_date: start, end_date: end }, CYQ_FIELDS),
     safeQuery("kpl_list", { ts_code: code, start_date: start, end_date: end }, KPL_FIELDS),
-    eastmoneyQuote(code), sinaQuote(code),
+    tencentQuote(code), eastmoneyQuote(code), sinaQuote(code),
   ]);
   if (!dailyR.rows.length) throw new Error("No daily history returned for this code");
   const hist=qfqDaily(dailyR.rows,adjR.rows).slice(-days), latestHist=hist.at(-1)!;
   const tr=normalizeTushareRealtimeQuote(rtR.rows.at(0)||null);
-  const rt=tr || emQ.data || sinaQ.data || null;
-  const source=tr?"tushare_rt_k":emQ.data?"eastmoney":sinaQ.data?"sina":null;
+  const rt=tr || txQ.data || emQ.data || sinaQ.data || null;
+  const source=tr?"tushare_rt_k":txQ.data?"tencent":emQ.data?"eastmoney":sinaQ.data?"sina":null;
   if(rt)rt.provider=source;
   const checks:Array<{source:string;row:Row|null;source_time?:string|null}>=[];
+  if(source!=="tencent"&&txQ.data)checks.push({source:"tencent",row:txQ.data,source_time:txQ.source_time});
   if(source!=="eastmoney"&&emQ.data)checks.push({source:"eastmoney",row:emQ.data,source_time:emQ.source_time});
   if(source!=="sina"&&sinaQ.data)checks.push({source:"sina",row:sinaQ.data,source_time:sinaQ.source_time});
   const quoteQuality=quoteConsensus(rt,checks);
@@ -281,7 +283,7 @@ async function stockSnapshot(code: string, url: URL) {
     data_mode:rt?(quoteQuality.status==="stale"?"stale_provider_quote":quoteQuality.status==="degraded"?"realtime_degraded":source==="tushare_rt_k"?"realtime_tushare":"realtime_multi_source_fallback"):"latest_completed_daily_fallback",
     data_quality:quoteQuality,
     info:basicR.rows.at(0)||{ts_code:code},quote:rt||latestHist,
-    quote_provider:{selected:source,tushare_rt_k_available:!!tr,eastmoney:{ok:emQ.ok,source_time:emQ.source_time,latency_ms:emQ.latency_ms,error:emQ.error},sina:{ok:sinaQ.ok,source_time:sinaQ.source_time,latency_ms:sinaQ.latency_ms,error:sinaQ.error}},
+    quote_provider:{selected:source,tushare_rt_k_available:!!tr,tencent:{ok:txQ.ok,source_time:txQ.source_time,latency_ms:txQ.latency_ms,error:txQ.error},eastmoney:{ok:emQ.ok,source_time:emQ.source_time,latency_ms:emQ.latency_ms,error:emQ.error},sina:{ok:sinaQ.ok,source_time:sinaQ.source_time,latency_ms:sinaQ.latency_ms,error:sinaQ.error}},
     price_context:{current:currentClose,previous_close:prevClose,pct_from_previous_close:currentClose!==null&&prevClose?(currentClose/prevClose-1)*100:null,...maDistances,recent_20d_high:highs20.length?Math.max(...highs20):null,recent_20d_low:lows20.length?Math.min(...lows20):null},
     technicals:tech,
     volume:{realtime_available:quoteIsTrustedCurrent,current_volume_hands:currentVolHands,latest_completed_daily_volume_hands:latestCompletedDailyVolHands,avg5_daily_volume_hands:avg5,trading_session_progress:progress,projected_full_day_volume_hands:projected,projected_volume_vs_5d_avg:projected!==null&&avg5?projected/avg5:null,note:quoteIsTrustedCurrent?`Current-session volume pace from ${source}.`:"A trusted current-session quote was not verified; projected intraday volume fields are intentionally null."},
@@ -291,7 +293,7 @@ async function stockSnapshot(code: string, url: URL) {
     margin:latestMargin,margin_freshness:latestMargin?"exchange_previous_day_update_around_08_30_cn":null,
     chip_cost:latestCyq,chip_cost_freshness:latestCyq?"post_close_18_19_cn_model_estimate":null,recent_limit_board_history:recentKpl,
     permission_errors:{realtime_quote:rtR.error,realtime_minute:minR.error,moneyflow_ths:flowThsR.error,stock_basic:basicR.error,daily_basic:dailyBasicR.error,margin_detail:marginR.error,cyq_perf:cyqR.error,kpl_list:kplR.error},
-    fallback_errors:{eastmoney_quote:emQ.error,sina_quote:sinaQ.error,eastmoney_minute:minuteFallbackErrors.eastmoney,sina_minute:minuteFallbackErrors.sina},
+    fallback_errors:{tencent_quote:txQ.error,eastmoney_quote:emQ.error,sina_quote:sinaQ.error,eastmoney_minute:minuteFallbackErrors.eastmoney,sina_minute:minuteFallbackErrors.sina},
     sources:["Tushare daily","Tushare adj_factor",source?`${source} quote`:null,minuteSource?`${minuteSource} minute`:null,latestFlow?flowSource:null,latestDailyBasic?"Tushare daily_basic":null,latestMargin?"Tushare margin_detail":null,latestCyq?"Tushare cyq_perf":null,recentKpl.length?"Tushare kpl_list":null].filter(Boolean),
     notes:["Tushare remains preferred. Free providers are used only when Tushare realtime/advanced permissions are unavailable or their request fails.","Realtime quote quality includes source timestamps when exposed and independent price cross-checks when available.","Daily technicals are calculated on Tushare qfq prices and rescaled to the exchange realtime pre_close basis when necessary (for example an ex-right/ex-dividend session); the current realtime bar is appended only for the active session.","Money-flow and daily_basic are post-close; margin_detail normally reflects the prior trading day.","Free web quote interfaces can change or rate-limit traffic; degraded/conflicting/stale states are surfaced instead of silently accepted."],
   };
@@ -378,28 +380,45 @@ async function stockRiskEvents(code: string, url: URL) {
 
 async function preferredRealtimeMarketFull() {
   const tr=await safeQuery("rt_k",{ts_code:A_SHARE_PATTERNS});
-  if(tr.rows.length){const rows:Row[]=enrichRealtime(tr.rows).map(r=>({...r,provider:"tushare_rt_k",source_time:s(r.trade_time)} as Row));const st=marketTradeTime(rows),fresh=realtimeSourceFreshness(st);if(fresh.ok)return {rows,source:"tushare_rt_k",coverage:"full",error:null as string|null,provider_errors:{tushare:null,eastmoney:null},source_time:st,source_freshness:fresh};}
+  if(tr.rows.length){const rows:Row[]=enrichRealtime(tr.rows).map(r=>({...r,provider:"tushare_rt_k",source_time:s(r.trade_time)} as Row));const st=marketTradeTime(rows),fresh=realtimeSourceFreshness(st);if(fresh.ok)return {rows,source:"tushare_rt_k",coverage:"full",error:null as string|null,provider_errors:{tushare:null,tencent:null,eastmoney:null,stock_basic:null},source_time:st,source_freshness:fresh};}
+
+  // With no paid rt_k permission, use Tushare's listed-stock universe as the authoritative
+  // symbol set and Tencent only as the current quote transport. This lets us measure coverage
+  // instead of assuming that a ranked webpage response represents the whole market.
+  const basic=await safeQuery("stock_basic",{list_status:"L"},"ts_code,symbol,name,industry,market,exchange,list_date");
+  if(basic.rows.length){
+    const meta=new Map(basic.rows.map(r=>[String(r.ts_code),r]));
+    const tx=await tencentQuotesBatched(basic.rows.map(r=>String(r.ts_code)).filter(Boolean));
+    const txFresh=realtimeSourceFreshness(tx.source_time);
+    if(tx.ok&&tx.coverage==="full"&&txFresh.ok){
+      const rows=tx.data.map(r=>({...meta.get(String(r.ts_code)),...r,provider:"tencent"} as Row));
+      return {rows,source:"tencent",coverage:"full",error:tx.error,provider_errors:{tushare:tr.error,tencent:tx.error,eastmoney:null,stock_basic:basic.error},source_time:tx.source_time,source_freshness:txFresh};
+    }
+  }
+
   const em=await eastmoneyMarketFullAttempt();
   const emFresh=realtimeSourceFreshness(em.source_time);
-  if(em.ok&&em.coverage==="full"&&emFresh.ok)return {rows:em.data,source:"eastmoney",coverage:"full",error:null as string|null,provider_errors:{tushare:tr.error,eastmoney:null},source_time:em.source_time,source_freshness:emFresh};
-  return {rows:[] as Row[],source:null as string|null,coverage:em.coverage||"unknown",error:em.error||tr.error,provider_errors:{tushare:tr.error,eastmoney:em.error||(!emFresh.ok?`Eastmoney full-market snapshot rejected: ${emFresh.reason}`:null)},source_time:em.source_time,source_freshness:emFresh};
+  if(em.ok&&em.coverage==="full"&&emFresh.ok)return {rows:em.data,source:"eastmoney",coverage:"full",error:null as string|null,provider_errors:{tushare:tr.error,tencent:"Tencent full-market coverage unavailable",eastmoney:null,stock_basic:basic.error},source_time:em.source_time,source_freshness:emFresh};
+  return {rows:[] as Row[],source:null as string|null,coverage:em.coverage||"unknown",error:em.error||tr.error,provider_errors:{tushare:tr.error,tencent:"Tencent full-market coverage unavailable or stale",eastmoney:em.error||(!emFresh.ok?`Eastmoney full-market snapshot rejected: ${emFresh.reason}`:null),stock_basic:basic.error},source_time:em.source_time,source_freshness:emFresh};
 }
 
 async function preferredQuotesForCodes(codes:string[]) {
   const uniq=[...new Set(codes)].filter(Boolean);if(!uniq.length)return {rows:[] as Row[],source:null as string|null,error:null as string|null};
   try{const rows=await realtimeForCodes(uniq);if(rows.length){const normalized=rows.map(r=>({...r,provider:"tushare_rt_k",source_time:s(r.trade_time)} as Row));const fresh=realtimeSourceFreshness(marketTradeTime(normalized));if(fresh.ok)return {rows:normalized,source:"tushare_rt_k",error:null};}}catch(e){
-    const chunks:string[][]=[];for(let i=0;i<uniq.length;i+=80)chunks.push(uniq.slice(i,i+80));const rs=await Promise.all(chunks.map(c=>eastmoneyQuotes(c)));const rows=rs.flatMap(x=>x.data);const st=rs.map(x=>x.source_time).filter((x):x is string=>!!x).sort().at(-1)||null;const fresh=realtimeSourceFreshness(st);if(rows.length&&fresh.ok)return {rows,source:"eastmoney",error:rs.map(x=>x.error).filter(Boolean).join("; ")||null};return {rows:[] as Row[],source:null,error:`Tushare: ${e instanceof Error?e.message:String(e)}; Eastmoney: ${rs.map(x=>x.error).filter(Boolean).join("; ")}; freshness: ${fresh.reason}`};
+    const tx=await tencentQuotesBatched(uniq,90,8);const txFresh=realtimeSourceFreshness(tx.source_time);if(tx.data.length&&txFresh.ok)return {rows:tx.data,source:"tencent",error:tx.error};
+    const chunks:string[][]=[];for(let i=0;i<uniq.length;i+=80)chunks.push(uniq.slice(i,i+80));const rs=await Promise.all(chunks.map(c=>eastmoneyQuotes(c)));const rows=rs.flatMap(x=>x.data);const st=rs.map(x=>x.source_time).filter((x):x is string=>!!x).sort().at(-1)||null;const fresh=realtimeSourceFreshness(st);if(rows.length&&fresh.ok)return {rows,source:"eastmoney",error:rs.map(x=>x.error).filter(Boolean).join("; ")||null};return {rows:[] as Row[],source:null,error:`Tushare: ${e instanceof Error?e.message:String(e)}; Tencent: ${tx.error}; Eastmoney: ${rs.map(x=>x.error).filter(Boolean).join("; ")}; freshness: ${fresh.reason}`};
   }
-  // Tushare may return rows that are not current (for example before the market opens);
-  // use the same free fallback path instead of silently labeling them realtime.
+  const tx=await tencentQuotesBatched(uniq,90,8);const txFresh=realtimeSourceFreshness(tx.source_time);if(tx.data.length&&txFresh.ok)return {rows:tx.data,source:"tencent",error:tx.error};
   const chunks:string[][]=[];for(let i=0;i<uniq.length;i+=80)chunks.push(uniq.slice(i,i+80));const rs=await Promise.all(chunks.map(c=>eastmoneyQuotes(c)));const rows=rs.flatMap(x=>x.data);const st=rs.map(x=>x.source_time).filter((x):x is string=>!!x).sort().at(-1)||null;const fresh=realtimeSourceFreshness(st);if(rows.length&&fresh.ok)return {rows,source:"eastmoney",error:null};
-  return {rows:[] as Row[],source:null,error:`No current realtime rows; Eastmoney freshness: ${fresh.reason}`};
+  return {rows:[] as Row[],source:null,error:`No current realtime rows; Tencent: ${tx.error}; Eastmoney freshness: ${fresh.reason}`};
 }
 
 async function preferredIndices() {
   const tr=await safeQuery("rt_idx_k",{ts_code:"000001.SH,399001.SZ,399006.SZ,000300.SH"});
   if(tr.rows.length){const st=marketTradeTime(tr.rows),fresh=realtimeSourceFreshness(st);if(fresh.ok)return {rows:enrichRealtime(tr.rows).map(r=>({...r,provider:"tushare_rt_idx_k"} as Row)),source:"tushare_rt_idx_k",error:null as string|null,source_time:st,source_freshness:fresh};}
-  const em=await eastmoneyIndices();const fresh=realtimeSourceFreshness(em.source_time);return {rows:em.ok&&fresh.ok?em.data:[],source:em.ok&&fresh.ok?"eastmoney":null,error:em.error||(!fresh.ok?`Eastmoney index snapshot rejected: ${fresh.reason}`:tr.error),source_time:em.source_time,permission_error:tr.error,source_freshness:fresh};
+  const tx=await tencentIndices();const txFresh=realtimeSourceFreshness(tx.source_time);
+  if(tx.ok&&txFresh.ok)return {rows:tx.data,source:"tencent",error:tx.error,source_time:tx.source_time,permission_error:tr.error,source_freshness:txFresh};
+  const em=await eastmoneyIndices();const fresh=realtimeSourceFreshness(em.source_time);return {rows:em.ok&&fresh.ok?em.data:[],source:em.ok&&fresh.ok?"eastmoney":null,error:tx.error||em.error||(!fresh.ok?`Eastmoney index snapshot rejected: ${fresh.reason}`:tr.error),source_time:em.source_time,permission_error:tr.error,source_freshness:fresh};
 }
 
 async function preferredIndustries(topN:number) {
@@ -468,15 +487,39 @@ async function marketOverview() {
     provider_errors:{realtime_market:live.provider_errors,realtime_indices:idx.error,post_close_fallback:fallbackError},sources:[live.source,idx.source,leadersSource].filter(Boolean)};
 }
 
+function industryProxy(rows:Row[], topN:number) {
+  const groups=new Map<string,Row[]>();
+  for(const r of rows){const industry=String(r.industry||"").trim();if(!industry||r.risk_name||n(r.pct_change)===null)continue;const xs=groups.get(industry)||[];xs.push(r);groups.set(industry,xs);}
+  const sectors:Row[]=[];
+  for(const [industry,xs] of groups){
+    const pcts=xs.map(r=>n(r.pct_change)).filter((x):x is number=>x!==null);if(pcts.length<3)continue;
+    const median=numericMedian(pcts),mean=pcts.reduce((a,b)=>a+b,0)/pcts.length,adv=pcts.filter(x=>x>0).length;
+    sectors.push({ts_code:`IND:${industry}`,symbol:`IND:${industry}`,name:industry,pct_change:median,pct_chg:median,mean_pct_change:mean,median_pct_change:median,advancers:adv,decliners:pcts.filter(x=>x<0).length,advancer_ratio:adv/pcts.length,member_count:pcts.length,amount:xs.reduce((a,r)=>a+(n(r.amount)||0),0),provider:"tushare_stock_basic+realtime_member_proxy",proxy_method:"median member pct_change; not an official industry index"});
+  }
+  return sectors.sort((a,b)=>(n(b.pct_change)||-999)-(n(a.pct_change)||-999)||(n(b.advancer_ratio)||0)-(n(a.advancer_ratio)||0)).slice(0,topN);
+}
+
 async function marketScan(url: URL) {
   const sectorTop=Math.max(3,Math.min(15,Number(url.searchParams.get("sector_top_n")||8))),leaderN=Math.max(1,Math.min(8,Number(url.searchParams.get("leaders_per_sector")||4))),marketTop=Math.max(5,Math.min(30,Number(url.searchParams.get("market_top_n")||15))),minAmountM=Math.max(0,Number(url.searchParams.get("min_amount_million")||100));
   const [live,industriesR]=await Promise.all([preferredRealtimeMarketFull(),preferredIndustries(sectorTop)]);
   let eligible:Row[]=live.rows.filter(r=>!r.risk_name&&n(r.close)!==null),topG:Row[]=[],topA:Row[]=[],candidates:Row[]=[],marketSource=live.source,marketCoverage=live.coverage;
+  let industryRows=[...industriesR.rows],industrySource=industriesR.source,industryError=industriesR.error,industryMemberRows=live.rows;
+  if(!industryRows.length&&live.rows.length){
+    let enriched=live.rows;
+    if(enriched.filter(r=>String(r.industry||"").trim()).length<Math.max(10,enriched.length*0.5)){
+      const basic=await safeQuery("stock_basic",{list_status:"L"},"ts_code,name,industry");const meta=new Map(basic.rows.map(r=>[String(r.ts_code),r]));enriched=live.rows.map(r=>({...meta.get(String(r.ts_code)),...r} as Row));industryError=[industryError,basic.error].filter(Boolean).join("; ")||null;
+    }
+    industryMemberRows=enriched;industryRows=industryProxy(enriched,sectorTop);
+    if(industryRows.length)industrySource="tushare_stock_basic+realtime_member_proxy";
+  }
   if(eligible.length){const liquid=eligible.filter(r=>(n(r.amount)||0)>=minAmountM*1e6);topG=topRows(eligible,"pct_change",marketTop);topA=topRows(eligible,"amount",marketTop);candidates=liquid.filter(r=>(n(r.pct_change)||0)>0&&(n(r.distance_from_high_pct)||-99)>=-2).sort((a,b)=>(n(b.pct_change)||0)-(n(a.pct_change)||0)||(n(b.amount)||0)-(n(a.amount)||0)).slice(0,marketTop);}
   else{const [g,a]=await Promise.all([eastmoneyMarketRank("pct_change",true,100),eastmoneyMarketRank("amount",true,100)]);const gf=g.ok&&realtimeSourceFreshness(g.source_time).ok,af=a.ok&&realtimeSourceFreshness(a.source_time).ok;topG=gf?g.data.slice(0,marketTop):[];topA=af?a.data.slice(0,marketTop):[];const union=new Map<string,Row>();[...(gf?g.data:[]),...(af?a.data:[])].forEach(r=>union.set(String(r.ts_code),r));eligible=[...union.values()].filter(r=>!r.risk_name);candidates=eligible.filter(r=>(n(r.amount)||0)>=minAmountM*1e6&&(n(r.pct_change)||0)>0&&(n(r.distance_from_high_pct)||-99)>=-2).sort((a,b)=>(n(b.pct_change)||0)-(n(a.pct_change)||0)||(n(b.amount)||0)-(n(a.amount)||0)).slice(0,marketTop);marketSource=(gf||af)?"eastmoney_ranked":null;marketCoverage="ranked_partial";}
   const industryLeaders:Row[]=[];
-  for(const sector of industriesR.rows){
-    if(industriesR.source==="tushare_rt_sw_k"){
+  for(const sector of industryRows){
+    if(industrySource==="tushare_stock_basic+realtime_member_proxy"){
+      const name=String(sector.name||"");const members=industryMemberRows.filter(r=>String(r.industry||"")===name&&!r.risk_name);
+      industryLeaders.push({sector_code:sector.ts_code,sector_name:name,sector_pct_change:sector.pct_change,sector_mean_pct_change:sector.mean_pct_change,sector_advancer_ratio:sector.advancer_ratio,leaders:members.sort((a,b)=>(n(b.pct_change)||-999)-(n(a.pct_change)||-999)).slice(0,leaderN),quote_source:live.source,quote_error:null,proxy_note:"Industry strength is a member-return proxy, not an official index return."});
+    } else if(industrySource==="tushare_rt_sw_k"){
       const code=s(sector.ts_code);if(!code)continue;const membersR=await safeQuery("index_member_all",{l1_code:code,is_new:"Y"},"l1_code,l1_name,ts_code,name,is_new");const codes=membersR.rows.map(r=>s(r.ts_code)).filter((x):x is string=>!!x);const quotes=await preferredQuotesForCodes(codes);industryLeaders.push({sector_code:code,sector_name:sector.name,sector_pct_change:sector.pct_change,leaders:quotes.rows.filter(r=>!r.risk_name).sort((a,b)=>(n(b.pct_change)||-999)-(n(a.pct_change)||-999)).slice(0,leaderN),member_error:membersR.error,quote_error:quotes.error,quote_source:quotes.source});
     } else {
       const boardCode=s(sector.symbol)||s(sector.ts_code);if(!boardCode)continue;const members=await eastmoneyBoardMembers(boardCode,300);industryLeaders.push({sector_code:boardCode,sector_name:sector.name,sector_pct_change:sector.pct_change,leaders:members.data.filter(r=>!r.risk_name).sort((a,b)=>(n(b.pct_change)||-999)-(n(a.pct_change)||-999)).slice(0,leaderN),quote_source:"eastmoney_board_members",quote_error:members.error});
@@ -485,8 +528,9 @@ async function marketScan(url: URL) {
   return {as_of_cn:cnNow(),data_mode:marketCoverage==="full"?`realtime_full_${marketSource}`:marketSource?"realtime_ranked_partial":"post_close_only",coverage:marketCoverage,
     freshness_note:marketCoverage==="full"?"Full realtime market cross-section available.":marketSource?"Realtime ranked lists are available, but this is not a complete all-stock universe; candidate scan coverage is partial.":"No realtime provider available.",
     filters:{min_amount_million:minAmountM,momentum_candidate_rule:"positive pct_change; within 2% of intraday high; turnover amount above threshold; excludes ST/退 names"},
-    strongest_industries:industriesR.rows,industry_source:industriesR.source,industry_leaders:industryLeaders,top_gainers:topG,top_turnover:topA,liquid_momentum_candidates:candidates,
-    provider_errors:{market:live.provider_errors,industry:industriesR.error},sources:[marketSource,industriesR.source].filter(Boolean)};
+    strongest_industries:industryRows,industry_source:industrySource,industry_leaders:industryLeaders,top_gainers:topG,top_turnover:topA,liquid_momentum_candidates:candidates,
+    provider_errors:{market:live.provider_errors,industry:industryError},sources:[marketSource,industrySource].filter(Boolean),
+    notes:[industrySource==="tushare_stock_basic+realtime_member_proxy"?"Industry ranking is a proxy based on the median realtime return of Tushare stock_basic industry members; it is not an official Shenwan index return.":null].filter(Boolean)};
 }
 
 async function latestAvailable(api: string, currentDate: string, params: Record<string, unknown> = {}) {
@@ -534,9 +578,12 @@ async function marketSentiment() {
 
 async function providerDiagnostics(url:URL){
   const code=normalizeCode(url.searchParams.get("ts_code")||"600522.SH"),freq=(url.searchParams.get("freq")||"5MIN").toUpperCase();
-  const [trQ,trM,emQ,siQ,emM,siM,emRank,emInd]=await Promise.all([safeQuery("rt_k",{ts_code:code}),safeQuery("rt_min_daily",{ts_code:code,freq}),eastmoneyQuote(code),sinaQuote(code),eastmoneyMinutes(code,freq),sinaMinutes(code,freq),eastmoneyMarketRank("pct_change",true,5),eastmoneyBoards("industry",10)]);
-  const tr=normalizeTushareRealtimeQuote(trQ.rows.at(0)||null),primary=tr||emQ.data||siQ.data||null;const checks:Array<{source:string;row:Row|null;source_time?:string|null}>=[];if(primary!==emQ.data&&emQ.data)checks.push({source:"eastmoney",row:emQ.data,source_time:emQ.source_time});if(primary!==siQ.data&&siQ.data)checks.push({source:"sina",row:siQ.data,source_time:siQ.source_time});
-  return {as_of_cn:cnNow(),ts_code:code,quote_consensus:quoteConsensus(primary,checks),providers:{tushare_rt_k:{ok:!!tr,error:trQ.error,row:tr},tushare_rt_min_daily:{ok:!!trM.rows.length,error:trM.error,last_bar:trM.rows.at(-1)||null},eastmoney_quote:{ok:emQ.ok,error:emQ.error,source_time:emQ.source_time,latency_ms:emQ.latency_ms,row:emQ.data},sina_quote:{ok:siQ.ok,error:siQ.error,source_time:siQ.source_time,latency_ms:siQ.latency_ms,row:siQ.data},eastmoney_minute:{ok:emM.ok,error:emM.error,source_time:emM.source_time,latency_ms:emM.latency_ms,last_bar:emM.data.at(-1)||null},sina_minute:{ok:siM.ok,error:siM.error,source_time:siM.source_time,latency_ms:siM.latency_ms,last_bar:siM.data.at(-1)||null},eastmoney_market_rank:{ok:emRank.ok,error:emRank.error,latency_ms:emRank.latency_ms,rows:emRank.data.length},eastmoney_industry:{ok:emInd.ok,error:emInd.error,latency_ms:emInd.latency_ms,rows:emInd.data.length}},notes:["Use this endpoint after deployment to verify which free providers are reachable from the Netlify egress IP.","A provider marked ok does not by itself prove independent accuracy; quote_consensus compares returned prices when multiple sources are available."]};
+  const [trQ,trM,txQ,emQ,siQ,emM,siM,emRank,emInd]=await Promise.all([safeQuery("rt_k",{ts_code:code}),safeQuery("rt_min_daily",{ts_code:code,freq}),tencentQuote(code),eastmoneyQuote(code),sinaQuote(code),eastmoneyMinutes(code,freq),sinaMinutes(code,freq),eastmoneyMarketRank("pct_change",true,5),eastmoneyBoards("industry",10)]);
+  const tr=normalizeTushareRealtimeQuote(trQ.rows.at(0)||null),primary=tr||txQ.data||emQ.data||siQ.data||null;const checks:Array<{source:string;row:Row|null;source_time?:string|null}>=[];
+  if(primary!==txQ.data&&txQ.data)checks.push({source:"tencent",row:txQ.data,source_time:txQ.source_time});
+  if(primary!==emQ.data&&emQ.data)checks.push({source:"eastmoney",row:emQ.data,source_time:emQ.source_time});
+  if(primary!==siQ.data&&siQ.data)checks.push({source:"sina",row:siQ.data,source_time:siQ.source_time});
+  return {as_of_cn:cnNow(),ts_code:code,quote_consensus:quoteConsensus(primary,checks),providers:{tushare_rt_k:{ok:!!tr,error:trQ.error,row:tr},tushare_rt_min_daily:{ok:!!trM.rows.length,error:trM.error,last_bar:trM.rows.at(-1)||null},tencent_quote:{ok:txQ.ok,error:txQ.error,source_time:txQ.source_time,latency_ms:txQ.latency_ms,row:txQ.data},eastmoney_quote:{ok:emQ.ok,error:emQ.error,source_time:emQ.source_time,latency_ms:emQ.latency_ms,row:emQ.data},sina_quote:{ok:siQ.ok,error:siQ.error,source_time:siQ.source_time,latency_ms:siQ.latency_ms,row:siQ.data},eastmoney_minute:{ok:emM.ok,error:emM.error,source_time:emM.source_time,latency_ms:emM.latency_ms,last_bar:emM.data.at(-1)||null},sina_minute:{ok:siM.ok,error:siM.error,source_time:siM.source_time,latency_ms:siM.latency_ms,last_bar:siM.data.at(-1)||null},eastmoney_market_rank:{ok:emRank.ok,error:emRank.error,latency_ms:emRank.latency_ms,rows:emRank.data.length},eastmoney_industry:{ok:emInd.ok,error:emInd.error,latency_ms:emInd.latency_ms,rows:emInd.data.length}},notes:["Tencent is used as an independent realtime quote cross-check and as a whole-market fallback only when measured symbol coverage is high enough.","Use this endpoint after deployment to verify which providers are reachable from the Netlify egress IP.","A provider marked ok does not by itself prove independent accuracy; quote_consensus compares returned prices when multiple sources are available."]};
 }
 
 export default async (req: Request, context: any) => {

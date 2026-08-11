@@ -146,6 +146,98 @@ export async function eastmoneyQuote(tsCode: string): Promise<ProviderResult<Row
   return { ...r, data: r.data.at(0) || null };
 }
 
+
+
+function tencentSymbol(tsCode: string): string {
+  const [code, ex] = tsCode.toUpperCase().split(".");
+  const prefix = ex === "SH" ? "sh" : ex === "SZ" ? "sz" : "bj";
+  return `${prefix}${code}`;
+}
+
+function tencentTimeToIso(value: unknown): string | null {
+  const x = String(value || "").trim();
+  if (!/^\d{14}$/.test(x)) return null;
+  return `${x.slice(0,4)}-${x.slice(4,6)}-${x.slice(6,8)}T${x.slice(8,10)}:${x.slice(10,12)}:${x.slice(12,14)}+08:00`;
+}
+
+async function fetchGbkText(url: string, timeoutMs = 5000): Promise<string> {
+  const r = await timedFetch(url, { headers: { accept: "text/plain,*/*" } }, timeoutMs);
+  if (!r.ok) throw new Error(`HTTP ${r.status}`);
+  const buf = await r.arrayBuffer();
+  try { return new TextDecoder("gb18030").decode(buf); }
+  catch { return new TextDecoder().decode(buf); }
+}
+
+function parseTencentQuotePayload(text: string, requested: Map<string,string>): Row[] {
+  const rows: Row[] = [];
+  const re = /v_([^=]+)="([^"]*)";?/g;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(text)) !== null) {
+    const symbol = m[1].replace(/^s_/, "");
+    const a = m[2].split("~");
+    if (a.length < 35) continue;
+    const tsCode = requested.get(symbol) || numericCodeToTs(String(a[2] || ""));
+    const close=n(a[3]), pre=n(a[4]), high=n(a[33]), low=n(a[34]);
+    const amountWan=n(a[37]);
+    const sourceTime=tencentTimeToIso(a[30]);
+    rows.push({
+      ts_code:tsCode, symbol:String(a[2]||""), name:a[1]||null,
+      close, pre_close:pre, open:n(a[5]), high, low,
+      change:n(a[31]) ?? (close!==null&&pre!==null?close-pre:null),
+      pct_change:n(a[32]) ?? (close!==null&&pre?(close/pre-1)*100:null),
+      pct_chg:n(a[32]) ?? (close!==null&&pre?(close/pre-1)*100:null),
+      // Tencent A-share quote field 6 is conventionally reported in hands.
+      vol:n(a[6]), vol_hands:n(a[6]),
+      // Field 37 is conventionally turnover amount in 10k CNY; normalize to yuan.
+      amount:amountWan!==null?amountWan*10000:null, amount_yuan:amountWan!==null?amountWan*10000:null,
+      turnover_rate:n(a[38]), pe_dynamic:n(a[39]), amplitude_pct:n(a[43]), pb:n(a[46]),
+      source_time:sourceTime, trade_time:sourceTime,
+      distance_from_high_pct:close!==null&&high?(close/high-1)*100:null,
+      rebound_from_low_pct:close!==null&&low?(close/low-1)*100:null,
+      risk_name:/ST|退/.test(String(a[1]||"")), provider:"tencent",
+    });
+  }
+  return rows;
+}
+
+export async function tencentQuotes(tsCodes: string[]): Promise<ProviderResult<Row[]>> {
+  const codes=[...new Set(tsCodes.map(x=>x.toUpperCase()))].filter(Boolean);
+  const key=`tx:q:${codes.slice().sort().join(",")}`;
+  const cached=cacheGet<ProviderResult<Row[]>>(key); if(cached) return cached;
+  const started=Date.now(), fetched=cnNow();
+  if(!codes.length) return {ok:true,source:"tencent",data:[],fetched_at_cn:fetched,source_time:null,latency_ms:0,error:null,coverage:"single"};
+  try{
+    const symbols=codes.map(tencentSymbol);
+    const requested=new Map(symbols.map((sym,i)=>[sym,codes[i]]));
+    const text=await fetchGbkText(`https://qt.gtimg.cn/q=${symbols.join(",")}`,5000);
+    const rows=parseTencentQuotePayload(text,requested);
+    const sourceTime=rows.map(r=>s(r.source_time)).filter((x):x is string=>!!x).sort().at(-1)||null;
+    const out:ProviderResult<Row[]>={ok:rows.length>0,source:"tencent",data:rows,fetched_at_cn:fetched,source_time:sourceTime,latency_ms:Date.now()-started,error:rows.length?null:"No Tencent quote rows",coverage:"single",total_reported:rows.length};
+    return cacheSet(key,out,7000);
+  }catch(e){return {ok:false,source:"tencent",data:[],fetched_at_cn:fetched,source_time:null,latency_ms:Date.now()-started,error:e instanceof Error?e.message:String(e),coverage:"single",total_reported:0};}
+}
+
+export async function tencentQuote(tsCode:string):Promise<ProviderResult<Row|null>>{
+  const r=await tencentQuotes([tsCode]); return {...r,data:r.data.at(0)||null};
+}
+
+export async function tencentQuotesBatched(tsCodes:string[], chunkSize=90, concurrency=8):Promise<ProviderResult<Row[]>>{
+  const codes=[...new Set(tsCodes.map(x=>x.toUpperCase()))].filter(Boolean);
+  const started=Date.now(),fetched=cnNow();
+  if(!codes.length)return {ok:true,source:"tencent",data:[],fetched_at_cn:fetched,source_time:null,latency_ms:0,error:null,coverage:"full",total_reported:0};
+  const chunks:string[][]=[];for(let i=0;i<codes.length;i+=chunkSize)chunks.push(codes.slice(i,i+chunkSize));
+  const results:ProviderResult<Row[]>[]=[];
+  for(let i=0;i<chunks.length;i+=concurrency){results.push(...await Promise.all(chunks.slice(i,i+concurrency).map(c=>tencentQuotes(c))));}
+  const byCode=new Map<string,Row>();for(const r of results)for(const row of r.data)byCode.set(String(row.ts_code),row);
+  const rows=[...byCode.values()]; const ratio=codes.length?rows.length/codes.length:1;
+  const sourceTime=results.map(x=>x.source_time).filter((x):x is string=>!!x).sort().at(-1)||null;
+  const errors=results.map(x=>x.error).filter((x):x is string=>!!x);
+  return {ok:rows.length>0,source:"tencent",data:rows,fetched_at_cn:fetched,source_time:sourceTime,latency_ms:Date.now()-started,error:errors.length?`${errors.length}/${results.length} Tencent batches failed; coverage ${(ratio*100).toFixed(1)}%`:null,coverage:ratio>=0.97?"full":"ranked_partial",total_reported:codes.length};
+}
+
+export async function tencentIndices():Promise<ProviderResult<Row[]>>{
+  return tencentQuotes(["000001.SH","399001.SZ","399006.SZ","000300.SH"]);
+}
 export async function sinaQuote(tsCode: string): Promise<ProviderResult<Row | null>> {
   const key = `sina:q:${tsCode}`;
   const cached = cacheGet<ProviderResult<Row|null>>(key); if (cached) return cached;

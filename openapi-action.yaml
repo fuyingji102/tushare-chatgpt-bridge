@@ -1,11 +1,11 @@
 openapi: 3.1.0
 info:
   title: A-share Market Discussion Data
-  version: 3.2.0
+  version: 3.2.1
   description: >
     Read-only A-share market data for ChatGPT discussion. Tushare is the preferred
     provider; when a realtime/advanced permission is unavailable the service can
-    fall back to public quote providers and returns explicit source, freshness,
+    fall back to Tencent/Eastmoney/Sina public quote providers and returns explicit source, freshness,
     coverage and cross-check quality fields. No brokerage or order functions.
 servers:
   - url: https://REPLACE_WITH_YOUR_NETLIFY_DOMAIN
@@ -96,7 +96,7 @@ paths:
       operationId: getStockSnapshot
       summary: Preferred one-call stock snapshot for current trading discussion.
       description: >
-        Tushare realtime is preferred. When unavailable, Eastmoney then Sina can supply realtime
+        Tushare realtime is preferred. When unavailable, Tencent, Eastmoney, then Sina can supply realtime
         quote/minute data. Returned data_quality contains timestamp freshness and independent quote
         cross-checks. Daily technicals remain based on Tushare qfq history. Also includes daily_basic,
         margin financing, post-close moneyflow with standard-moneyflow fallback, optional chip-cost,

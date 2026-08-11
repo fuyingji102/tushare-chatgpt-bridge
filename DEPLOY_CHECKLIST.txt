@@ -1,11 +1,11 @@
-Tushare ChatGPT Bridge V3.2 — upgrade checklist
+Tushare ChatGPT Bridge V3.2.1 — upgrade checklist
 
-[ ] Replace repo-root files with V3.2
+[ ] Replace repo-root files with V3.2.1
 [ ] Do NOT copy any real token into GitHub
 [ ] Existing Netlify env TUSHARE_TOKEN remains set
 [ ] Existing Netlify env ACTION_API_KEY remains set
 [ ] git add -A
-[ ] git commit -m "Upgrade to V3.2 multi-source fallback"
+[ ] git commit -m "Upgrade to V3.2.1 multi-source fallback"
 [ ] git push
 [ ] Netlify deploy is Published
 [ ] /health returns version 3.2.0

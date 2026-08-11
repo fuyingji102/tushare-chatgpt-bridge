@@ -1,6 +1,6 @@
 {
-  "name": "tushare-chatgpt-bridge-v3-2-netlify",
-  "version": "3.2.0",
+  "name": "tushare-chatgpt-bridge-v3-2-1-netlify",
+  "version": "3.2.1",
   "private": true,
   "type": "module",
   "scripts": {
