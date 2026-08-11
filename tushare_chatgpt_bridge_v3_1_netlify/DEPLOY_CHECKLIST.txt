@@ -1,0 +1,15 @@
+你要做的事情（最短版）
+
+[ ] 1. 解压 V3.1 包
+[ ] 2. 上传到一个私有 GitHub 仓库
+[ ] 3. Netlify -> Import from GitHub -> 选择该仓库 -> Deploy
+[ ] 4. Netlify Environment variables 添加 TUSHARE_TOKEN
+[ ] 5. 生成随机 ACTION_API_KEY，并在 Netlify 添加它
+[ ] 6. Redeploy
+[ ] 7. 测试 https://你的站点.netlify.app/health
+[ ] 8. 测试 /stock/600522.SH/snapshot、/stock/600522.SH/context、/market/overview
+[ ] 9. openapi-action.yaml 中替换 Netlify 域名
+[ ] 10. 在 GPT Action 中配置 X-API-Key + 粘贴 OpenAPI schema
+[ ] 11. 把 PROJECT_INSTRUCTIONS.txt 放进你的 A股交易 GPT/项目规则
+
+完成后，以后聊天中不需要再把 Tushare token 发给 ChatGPT。

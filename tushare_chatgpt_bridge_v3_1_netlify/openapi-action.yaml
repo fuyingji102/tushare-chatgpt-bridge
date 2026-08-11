@@ -1,0 +1,148 @@
+openapi: 3.1.0
+info:
+  title: A-share Market Discussion Data
+  version: 3.1.0
+  description: Read-only fresh A-share market data for ChatGPT trading discussion. No brokerage or order functions.
+servers:
+  - url: https://REPLACE_WITH_YOUR_NETLIFY_DOMAIN
+security:
+  - ApiKeyAuth: []
+paths:
+  /health:
+    get:
+      operationId: healthCheck
+      summary: Check whether the market-data service is online.
+      responses:
+        "200": { description: Health status }
+  /market/overview:
+    get:
+      operationId: getMarketOverview
+      summary: Get realtime A-share market breadth, major indices, turnover and leaders.
+      responses:
+        "200": { description: Realtime market overview }
+  /market/sentiment:
+    get:
+      operationId: getMarketSentiment
+      summary: Get realtime market sentiment including sealed limit-ups, opened boards, limit-downs and estimated streak ladder.
+      description: Uses realtime quotes plus today's official limit prices. Estimated streak uses prior-day ladder and is explicitly an inference.
+      responses:
+        "200": { description: Realtime market sentiment }
+  /market/scan:
+    get:
+      operationId: getMarketScan
+      summary: Scan realtime strong industries, industry leaders, top gainers, turnover leaders and liquid momentum candidates.
+      parameters:
+        - { name: sector_top_n, in: query, required: false, schema: { type: integer, default: 8, minimum: 3, maximum: 15 } }
+        - { name: leaders_per_sector, in: query, required: false, schema: { type: integer, default: 4, minimum: 1, maximum: 8 } }
+        - { name: market_top_n, in: query, required: false, schema: { type: integer, default: 15, minimum: 5, maximum: 30 } }
+        - { name: min_amount_million, in: query, required: false, schema: { type: number, default: 100, minimum: 0 } }
+      responses:
+        "200": { description: Realtime market scan }
+  /market/themes:
+    get:
+      operationId: getMarketThemes
+      summary: Evaluate concept themes and retrieve latest strong-theme and theme-moneyflow context.
+      description: If q is supplied, matching THS concepts are evaluated against current member quotes. Board/moneyflow context is post-close and dated.
+      parameters:
+        - name: q
+          in: query
+          required: false
+          schema: { type: string }
+          description: Concept name or comma-separated names, for example MLCC,创新药,光通信.
+        - { name: top_n, in: query, required: false, schema: { type: integer, default: 8, minimum: 3, maximum: 15 } }
+        - { name: leaders, in: query, required: false, schema: { type: integer, default: 5, minimum: 3, maximum: 10 } }
+      responses:
+        "200": { description: Theme evaluation and context }
+  /stock/{ts_code}/snapshot:
+    get:
+      operationId: getStockSnapshot
+      summary: Preferred one-call stock snapshot for current trading discussion.
+      description: Returns realtime quote when permitted, MA5/10/20/60, MACD, RSI14, Slow KDJ, volume pace, 20-day range, latest post-close moneyflow, daily_basic, financing/margin context, chip-cost estimate, and recent KPL board history.
+      parameters:
+        - name: ts_code
+          in: path
+          required: true
+          schema: { type: string }
+          description: Tushare stock code such as 600522.SH.
+        - name: freq
+          in: query
+          required: false
+          schema: { type: string, enum: [1MIN, 5MIN, 15MIN, 30MIN, 60MIN], default: 5MIN }
+        - name: daily_days
+          in: query
+          required: false
+          schema: { type: integer, minimum: 80, maximum: 500, default: 180 }
+      responses:
+        "200": { description: Stock snapshot }
+  /stock/{ts_code}/context:
+    get:
+      operationId: getStockTradingContext
+      summary: Get post-close trading context including turnover/valuation, margin financing, chip-cost distribution, and KPL board history.
+      description: Uses Tushare daily_basic, margin_detail, cyq_perf, and kpl_list with original provider field names.
+      parameters:
+        - { name: ts_code, in: path, required: true, schema: { type: string } }
+        - { name: days, in: query, required: false, schema: { type: integer, minimum: 20, maximum: 240, default: 90 } }
+      responses:
+        "200": { description: Stock trading context }
+  /stock/{ts_code}/lhb:
+    get:
+      operationId: getStockDragonTiger
+      summary: Get recent Dragon-Tiger List institution/broker-seat detail for one stock.
+      description: Uses Tushare top_inst. Without trade_date, checks a small recent trading-day window and returns sessions where the stock appeared.
+      parameters:
+        - { name: ts_code, in: path, required: true, schema: { type: string } }
+        - name: trade_date
+          in: query
+          required: false
+          schema: { type: string, pattern: '^\d{8}$' }
+          description: Optional exact YYYYMMDD date.
+        - { name: days, in: query, required: false, schema: { type: integer, minimum: 1, maximum: 10, default: 5 } }
+      responses:
+        "200": { description: Dragon-Tiger List details }
+  /stock/{ts_code}/risk-events:
+    get:
+      operationId: getStockRiskEvents
+      summary: Get upcoming/recent event-risk context for one stock.
+      description: Includes share unlocks, shareholder increases/decreases, earnings forecasts, disclosure schedule, and recent repurchase records.
+      parameters:
+        - { name: ts_code, in: path, required: true, schema: { type: string } }
+        - { name: forward_days, in: query, required: false, schema: { type: integer, minimum: 30, maximum: 365, default: 90 } }
+        - { name: backward_days, in: query, required: false, schema: { type: integer, minimum: 30, maximum: 365, default: 120 } }
+      responses:
+        "200": { description: Stock event-risk context }
+  /stock/{ts_code}/intraday:
+    get:
+      operationId: getStockIntraday
+      summary: Get today's cumulative intraday minute bars for one stock.
+      parameters:
+        - { name: ts_code, in: path, required: true, schema: { type: string } }
+        - name: freq
+          in: query
+          required: false
+          schema: { type: string, enum: [1MIN, 5MIN, 15MIN, 30MIN, 60MIN], default: 5MIN }
+      responses:
+        "200": { description: Intraday bars }
+  /stock/{ts_code}/daily:
+    get:
+      operationId: getStockDaily
+      summary: Get qfq daily bars for one stock.
+      parameters:
+        - { name: ts_code, in: path, required: true, schema: { type: string } }
+        - { name: days, in: query, required: false, schema: { type: integer, minimum: 20, maximum: 500, default: 120 } }
+      responses:
+        "200": { description: QFQ daily bars }
+  /stock/{ts_code}/moneyflow:
+    get:
+      operationId: getStockMoneyflow
+      summary: Get recent post-close stock moneyflow.
+      parameters:
+        - { name: ts_code, in: path, required: true, schema: { type: string } }
+        - { name: days, in: query, required: false, schema: { type: integer, minimum: 1, maximum: 120, default: 20 } }
+      responses:
+        "200": { description: Moneyflow history }
+components:
+  securitySchemes:
+    ApiKeyAuth:
+      type: apiKey
+      in: header
+      name: X-API-Key
